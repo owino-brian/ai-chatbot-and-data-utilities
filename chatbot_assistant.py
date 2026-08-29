@@ -19,19 +19,29 @@ Design principles
 3.  Browser-native GUI. Everything runs through Streamlit; there is no
     Tkinter or desktop GUI dependency, which keeps it deployable to any
     standard Streamlit host.
-4.  No required API keys. The base assistant, chat history, file workspace
-    and knowledge base all work without any secrets configured. Live search
-    only touches public, unauthenticated endpoints.
+4.  No required API keys. The base assistant, chat history and knowledge
+    base all work without any secrets configured. Live search only touches
+    public, unauthenticated endpoints by default; a real Google result set
+    can be added on top of that if the deployer sets an optional API key
+    (see the Google Custom Search section below), but nothing breaks
+    without one.
+
+This file requires Streamlit 1.43 or later. Two features used here landed
+together in that release: st.chat_input(accept_file=...), which gives the
+message box its own native attachment control, and st.context.timezone_offset,
+which is how the greeting is timed to the visitor's own local clock instead
+of the server's.
 """
 
 from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +57,8 @@ import streamlit as st
 APP_TITLE = "OBO Chatbot"
 DEVELOPER = "Owino Brian Otieno"
 HUMAN_AGENTS_LABEL = "OBO Human Agents"
+DEVELOPER_SPONSOR_URL = "https://github.com/sponsors/owino-brian"
+DEVELOPER_LINKEDIN_URL = "https://www.linkedin.com/in/owinobrian/"
 DB_PATH = Path("obo_chatbot_history.db")
 MAX_UPLOAD_MB = 50
 MAX_HISTORY_ITEMS = 40
@@ -60,7 +72,6 @@ MIN_MATCH_SCORE = 2  # below this, a knowledge-base match is not trusted
 
 st.set_page_config(
     page_title=APP_TITLE,
-    page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -94,19 +105,45 @@ st.markdown(
         .obo-card-title { font-weight: 650; margin-bottom: 4px; }
         .obo-card-text { color: #6b7280; font-size: 0.86rem; line-height: 1.45; }
 
-        .obo-redirect {
-            border-left: 4px solid #d97706;
-            background: #fffbeb;
-            padding: 10px 14px;
-            border-radius: 6px;
-            margin-top: 8px;
-        }
-
         .obo-footer { text-align: center; color: #9ca3af; font-size: 0.72rem; padding: 26px 0 8px 0; }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+
+# =============================================================================
+# LOCAL TIME (used for the greeting)
+# =============================================================================
+
+def visitor_local_time() -> datetime:
+    """Best-effort local time of the person using the app, from the browser's
+    own UTC offset via st.context.timezone_offset. Falls back to the
+    server's local time if that is unavailable for any reason (older
+    Streamlit version, or the value not being reported yet on this run)."""
+    try:
+        offset_minutes = st.context.timezone_offset
+        if offset_minutes is not None:
+            tz = timezone(-timedelta(minutes=offset_minutes))
+            return datetime.now(timezone.utc).astimezone(tz)
+    except Exception:
+        pass
+    return datetime.now()
+
+
+def time_of_day_greeting(hour: int) -> str:
+    if 5 <= hour < 12:
+        return "Good morning"
+    if 12 <= hour < 17:
+        return "Good afternoon"
+    if 17 <= hour < 22:
+        return "Good evening"
+    return "Hello"
+
+
+def opening_greeting() -> str:
+    hour = visitor_local_time().hour
+    return f"{time_of_day_greeting(hour)}! I am {APP_TITLE}. How may I help you?"
 
 
 # =============================================================================
@@ -141,6 +178,13 @@ def initialise_database() -> None:
             created_at TEXT NOT NULL
         )
         """
+    )
+    # A previous version of this app created a conversation row the moment
+    # "New chat" was clicked, before any message existed, which is why the
+    # sidebar could fill up with empty "New conversation" entries. This
+    # clears out any such leftover rows from an existing database file.
+    conn.execute(
+        "DELETE FROM conversations WHERE id NOT IN (SELECT DISTINCT conversation_id FROM messages)"
     )
     conn.commit()
     conn.close()
@@ -199,7 +243,11 @@ def save_message(conversation_id: str, role: str, content: str) -> None:
 def recent_conversations(limit: int = MAX_HISTORY_ITEMS) -> list[sqlite3.Row]:
     conn = get_connection()
     rows = conn.execute(
-        "SELECT id, title, updated_at FROM conversations ORDER BY updated_at DESC LIMIT ?",
+        """
+        SELECT id, title, updated_at FROM conversations c
+        WHERE EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id)
+        ORDER BY updated_at DESC LIMIT ?
+        """,
         (limit,),
     ).fetchall()
     conn.close()
@@ -866,6 +914,10 @@ _CONVERSATION_PATTERNS: list[tuple[tuple[str, ...], str]] = [
      "Ready to help. Send me a question, a piece of code, a research problem or a dataset."),
     (("thank you", "thanks"), "You're welcome. Send the next question whenever you are ready."),
     (("bye", "goodbye", "see you"), "Goodbye. You can start a new conversation any time."),
+    (("who is your developer", "who developed you", "who created you", "who made you", "who built you"),
+     f"I was built by **{DEVELOPER}**. You can support the work or get in touch here:\n\n"
+     f"- Sponsor on GitHub: {DEVELOPER_SPONSOR_URL}\n"
+     f"- LinkedIn: {DEVELOPER_LINKEDIN_URL}"),
 ]
 
 
@@ -1086,6 +1138,106 @@ def _search_wikipedia(query: str, limit: int = 3) -> list[dict[str, str]]:
     return results
 
 
+def _search_duckduckgo(query: str) -> list[dict[str, str]]:
+    """DuckDuckGo's Instant Answer API is the closest thing to a general web
+    search that works with no API key. It is much narrower than a real
+    Google result page (it mainly surfaces topic summaries and related
+    concepts, not arbitrary ranked web pages), which is a genuine
+    limitation worth knowing about rather than papering over."""
+    response = _safe_get(
+        "https://api.duckduckgo.com/",
+        {"q": query[:180], "format": "json", "no_html": 1, "skip_disambig": 1},
+    )
+    if response is None:
+        return []
+    try:
+        data = response.json()
+    except ValueError:
+        return []
+
+    results: list[dict[str, str]] = []
+    if data.get("AbstractText") and data.get("AbstractURL"):
+        results.append({
+            "source": "DuckDuckGo",
+            "title": data.get("Heading") or query,
+            "summary": data["AbstractText"],
+            "url": data["AbstractURL"],
+        })
+    for topic in data.get("RelatedTopics", [])[:4]:
+        if isinstance(topic, dict) and topic.get("FirstURL") and topic.get("Text"):
+            results.append({
+                "source": "DuckDuckGo",
+                "title": topic["Text"].split(" - ")[0][:90],
+                "summary": topic["Text"],
+                "url": topic["FirstURL"],
+            })
+    return results
+
+
+def _search_reddit(query: str, limit: int = 3) -> list[dict[str, str]]:
+    """Public, read-only Reddit search. This uses no OAuth token, which
+    means it can be rate-limited or blocked by Reddit at any time; it is
+    included as a best-effort look at social/community discussion, not a
+    guaranteed source. A dropped or empty response is treated the same as
+    any other source that came up empty."""
+    response = _safe_get(
+        "https://www.reddit.com/search.json",
+        {"q": query[:180], "limit": limit, "sort": "relevance"},
+    )
+    if response is None:
+        return []
+    try:
+        data = response.json()
+    except ValueError:
+        return []
+    results = []
+    for child in data.get("data", {}).get("children", [])[:limit]:
+        post = child.get("data", {})
+        title = post.get("title")
+        permalink = post.get("permalink")
+        if not title or not permalink:
+            continue
+        results.append({
+            "source": "Reddit",
+            "title": title,
+            "summary": f"r/{post.get('subreddit', 'reddit')} discussion.",
+            "url": "https://www.reddit.com" + permalink,
+        })
+    return results
+
+
+def _search_google_custom(query: str, limit: int = 4) -> list[dict[str, str]]:
+    """Real Google results, but only if the deployer has set up a (free
+    tier available) Google Programmable Search Engine and supplied its
+    key and search-engine id as GOOGLE_CSE_API_KEY / GOOGLE_CSE_CX in
+    Streamlit secrets or environment variables. There is no official way
+    to query Google search results without credentials, so this stays
+    optional rather than pretending to work out of the box."""
+    api_key = st.secrets.get("GOOGLE_CSE_API_KEY", os.getenv("GOOGLE_CSE_API_KEY", ""))
+    cx = st.secrets.get("GOOGLE_CSE_CX", os.getenv("GOOGLE_CSE_CX", ""))
+    if not api_key or not cx:
+        return []
+    response = _safe_get(
+        "https://www.googleapis.com/customsearch/v1",
+        {"key": api_key, "cx": cx, "q": query[:180], "num": limit},
+    )
+    if response is None:
+        return []
+    try:
+        data = response.json()
+    except ValueError:
+        return []
+    return [
+        {
+            "source": "Google",
+            "title": item.get("title", "Result"),
+            "summary": item.get("snippet", ""),
+            "url": item.get("link", ""),
+        }
+        for item in data.get("items", [])[:limit]
+    ]
+
+
 _LIVE_SEARCH_TRIGGERS = (
     "find current", "find recent", "find github", "find repositories",
     "find projects", "current github", "on github", "github projects",
@@ -1108,9 +1260,13 @@ def is_live_search_intent(question: str) -> bool:
 
 
 def run_live_search(question: str) -> list[dict[str, str]]:
-    """Query a handful of public, unauthenticated sources. Results are only
-    ever shown as attributed links, never rewritten into freestanding
-    factual claims, which is what keeps this feature hallucination-free."""
+    """Query a handful of public sources. Results are only ever shown as
+    attributed links, never rewritten into freestanding factual claims,
+    which is what keeps this feature hallucination-free. This checks
+    developer/technical sources, academic sources, a general-web source
+    (DuckDuckGo, plus real Google results if the deployer has configured
+    an API key), community/social discussion (Reddit) and finally
+    Wikipedia as a fallback."""
     q = normalise(question)
     results: list[dict[str, str]] = []
 
@@ -1120,6 +1276,10 @@ def run_live_search(question: str) -> list[dict[str, str]]:
 
     if any(x in q for x in ("research", "paper", "study", "literature", "journal", "academic")):
         results.extend(_search_crossref(question))
+
+    results.extend(_search_google_custom(question))
+    results.extend(_search_duckduckgo(question))
+    results.extend(_search_reddit(question))
 
     if not results:
         results.extend(_search_wikipedia(question))
@@ -1282,8 +1442,8 @@ with st.sidebar:
     st.divider()
     st.markdown("**Support the developer**")
     st.markdown(
-        "[💛 Sponsor on GitHub](https://github.com/sponsors/owino-brian)  \n"
-        "[🔗 Connect on LinkedIn](https://www.linkedin.com/in/owinobrian/)"
+        f"[Sponsor on GitHub]({DEVELOPER_SPONSOR_URL})  \n"
+        f"[Connect on LinkedIn]({DEVELOPER_LINKEDIN_URL})"
     )
 
 
@@ -1303,11 +1463,14 @@ st.markdown(
 )
 
 if not st.session_state.messages:
+    with st.chat_message("assistant"):
+        st.markdown(opening_greeting())
+
     cols = st.columns(3)
     cards = [
-        ("💻 Technology", "Programming languages, web development, databases, cloud, DevOps and cybersecurity."),
-        ("🤖 AI & Data", "Machine learning, generative AI, RAG, data analysis, algorithms and your uploaded files."),
-        ("🎓 Academic", "Research methodology, literature reviews, dissertations, statistics and referencing."),
+        ("Technology", "Programming languages, web development, databases, cloud, DevOps and cybersecurity."),
+        ("AI & Data", "Machine learning, generative AI, RAG, data analysis, algorithms and your uploaded files."),
+        ("Academic", "Research methodology, literature reviews, dissertations, statistics and referencing."),
     ]
     for column, (title, text) in zip(cols, cards):
         with column:
@@ -1323,7 +1486,7 @@ for message in st.session_state.messages:
         st.markdown(message["content"])
 
 if st.session_state.uploaded_data is not None:
-    with st.expander(f"📎 File workspace · {st.session_state.uploaded_name}", expanded=False):
+    with st.expander(f"File workspace · {st.session_state.uploaded_name}", expanded=False):
         df = st.session_state.uploaded_data
         summary = summarise_dataframe(df)
 
@@ -1343,39 +1506,16 @@ if st.session_state.uploaded_data is not None:
         csv_bytes = st.session_state.uploaded_data.to_csv(index=False).encode("utf-8")
         st.download_button("Download cleaned CSV", data=csv_bytes, file_name="cleaned_data.csv", mime="text/csv")
 
-# ---- Compact toolbar right above the message box: attach + live search ----
-# This mirrors a Claude-style layout, where the attachment and search
-# controls sit next to the input instead of being buried in the sidebar.
-toolbar_left, toolbar_mid, toolbar_right = st.columns([0.09, 0.22, 0.69])
+# ---- Message box row: a compact live-search toggle beside the input, and ----
+# file attachment handled natively by chat_input's own "+" control. Streamlit
+# does not let a custom icon be injected inside the native input bar itself,
+# so the closest faithful equivalent is the built-in attach control plus a
+# toggle placed immediately next to it.
+toggle_col, input_col = st.columns([0.16, 0.84])
 
-with toolbar_left:
-    with st.popover("📎", use_container_width=True, help="Attach a file"):
-        st.markdown("**Attach a file**")
-        uploaded = st.file_uploader(
-            "Upload a file",
-            type=["csv", "xlsx", "xls", "json", "txt", "md"],
-            label_visibility="collapsed",
-            key="obo_file_uploader",
-        )
-        if uploaded is not None and st.session_state.uploaded_name != uploaded.name:
-            df, error = read_uploaded_file(uploaded)
-            if error:
-                st.error(error)
-            else:
-                st.session_state.uploaded_data = df
-                st.session_state.uploaded_name = uploaded.name
-                st.rerun()
-
-        if st.session_state.uploaded_data is not None:
-            st.success(f"Loaded: {st.session_state.uploaded_name}")
-            if st.button("Remove file", use_container_width=True):
-                st.session_state.uploaded_data = None
-                st.session_state.uploaded_name = None
-                st.rerun()
-
-with toolbar_mid:
+with toggle_col:
     st.session_state.live_search_enabled = st.toggle(
-        "🔍 Live search",
+        "Search",
         value=st.session_state.live_search_enabled,
         help=(
             "Only used when a question is outside the knowledge base, or when you explicitly "
@@ -1384,25 +1524,58 @@ with toolbar_mid:
         ),
     )
 
-question = st.chat_input(f"Message {APP_TITLE}...")
+with input_col:
+    prompt = st.chat_input(
+        f"Message {APP_TITLE}...",
+        accept_file="multiple",
+        file_type=["csv", "xlsx", "xls", "json", "txt", "md"],
+    )
 
-if question:
-    question = question.strip()
+question = ""
+attachment_summary = ""
+attachment_error = ""
 
-if question:
-    st.session_state.messages.append({"role": "user", "content": question})
+if prompt:
+    question = (prompt.text or "").strip()
+    for attached in prompt["files"] or []:
+        df, error = read_uploaded_file(attached)
+        if error:
+            attachment_error = f"I could not read {attached.name}: {error}"
+        else:
+            st.session_state.uploaded_data = df
+            st.session_state.uploaded_name = attached.name
+            summary = summarise_dataframe(df)
+            attachment_summary = (
+                f"I've loaded **{attached.name}** into the file workspace above this message box "
+                f"({summary['rows']} rows, {summary['columns']} columns, {summary['missing']} "
+                f"missing values, {summary['duplicates']} duplicate rows). You can preview, clean "
+                "or download it from there."
+            )
+
+if question or attachment_summary or attachment_error:
+    display_question = question or "Uploaded a file."
+    st.session_state.messages.append({"role": "user", "content": display_question})
 
     if len(st.session_state.messages) == 1:
-        ensure_conversation_row(st.session_state.conversation_id, question)
+        ensure_conversation_row(st.session_state.conversation_id, display_question)
 
-    save_message(st.session_state.conversation_id, "user", question)
+    save_message(st.session_state.conversation_id, "user", display_question)
 
     with st.chat_message("user"):
-        st.markdown(question)
+        st.markdown(display_question)
 
     with st.chat_message("assistant"):
-        with st.spinner("Checking the knowledge base..."):
-            answer, evidence = generate_answer(question, st.session_state.live_search_enabled)
+        evidence: list[dict[str, str]] = []
+        parts = []
+        if attachment_error:
+            parts.append(attachment_error)
+        elif attachment_summary:
+            parts.append(attachment_summary)
+        if question:
+            with st.spinner("Checking the knowledge base..."):
+                text_answer, evidence = generate_answer(question, st.session_state.live_search_enabled)
+            parts.append(text_answer)
+        answer = "\n\n".join(parts)
         st.markdown(answer)
         if evidence:
             with st.expander(f"Sources · {len(evidence)}", expanded=False):
@@ -1417,7 +1590,7 @@ if question:
 st.markdown(
     f'<div class="obo-footer">{APP_TITLE} · Developer: {DEVELOPER} · '
     f'Unanswered questions are redirected to {HUMAN_AGENTS_LABEL}<br>'
-    f'<a href="https://github.com/sponsors/owino-brian" target="_blank">Support on GitHub</a> · '
-    f'<a href="https://www.linkedin.com/in/owinobrian/" target="_blank">LinkedIn</a></div>',
+    f'<a href="{DEVELOPER_SPONSOR_URL}" target="_blank">Support on GitHub</a> · '
+    f'<a href="{DEVELOPER_LINKEDIN_URL}" target="_blank">LinkedIn</a></div>',
     unsafe_allow_html=True,
 )

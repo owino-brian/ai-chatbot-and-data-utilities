@@ -150,17 +150,28 @@ def now_string() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def create_conversation() -> str:
-    conversation_id = str(uuid.uuid4())
-    stamp = now_string()
+def new_conversation_id() -> str:
+    """Generate a fresh conversation id without touching the database. A row
+    is only written once the first real message is sent (see
+    ensure_conversation_row), which is what keeps the sidebar history free
+    of empty 'New conversation' placeholders."""
+    return str(uuid.uuid4())
+
+
+def ensure_conversation_row(conversation_id: str, title_seed: str) -> None:
     conn = get_connection()
-    conn.execute(
-        "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
-        (conversation_id, "New conversation", stamp, stamp),
-    )
-    conn.commit()
+    exists = conn.execute(
+        "SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)
+    ).fetchone()
+    if exists is None:
+        stamp = now_string()
+        title = re.sub(r"\s+", " ", title_seed).strip()[:58] or "New conversation"
+        conn.execute(
+            "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (conversation_id, title, stamp, stamp),
+        )
+        conn.commit()
     conn.close()
-    return conversation_id
 
 
 def load_conversation(conversation_id: str) -> list[dict[str, str]]:
@@ -185,14 +196,6 @@ def save_message(conversation_id: str, role: str, content: str) -> None:
     conn.close()
 
 
-def update_conversation_title(conversation_id: str, question: str) -> None:
-    title = re.sub(r"\s+", " ", question).strip()[:58] or "New conversation"
-    conn = get_connection()
-    conn.execute("UPDATE conversations SET title = ? WHERE id = ?", (title, conversation_id))
-    conn.commit()
-    conn.close()
-
-
 def recent_conversations(limit: int = MAX_HISTORY_ITEMS) -> list[sqlite3.Row]:
     conn = get_connection()
     rows = conn.execute(
@@ -211,7 +214,7 @@ initialise_database()
 # =============================================================================
 
 if "conversation_id" not in st.session_state:
-    st.session_state.conversation_id = create_conversation()
+    st.session_state.conversation_id = new_conversation_id()
 
 if "messages" not in st.session_state:
     st.session_state.messages = load_conversation(st.session_state.conversation_id)
@@ -783,6 +786,60 @@ KNOWLEDGE_BASE: list[dict[str, Any]] = [
 
 KNOWLEDGE_CATEGORIES: list[str] = sorted({entry["category"] for entry in KNOWLEDGE_BASE})
 
+# When someone types a single broad word or short phrase rather than a
+# specific question ("research", "cloud", "cybersecurity"), it is more
+# useful to show them what is available in that area than to redirect them
+# straight to a human, since the knowledge base clearly does cover that
+# ground in general even if this exact phrasing did not score a match.
+CATEGORY_ALIASES: dict[str, str] = {
+    "research": "Academic Research",
+    "academic research": "Academic Research",
+    "academic": "Academic Research",
+    "referencing": "Referencing",
+    "citations": "Referencing",
+    "programming": "Programming Languages",
+    "coding": "Programming Languages",
+    "programming languages": "Programming Languages",
+    "web development": "Web Development",
+    "web dev": "Web Development",
+    "databases": "Databases",
+    "database": "Databases",
+    "cloud": "Cloud & DevOps",
+    "devops": "Cloud & DevOps",
+    "cloud computing": "Cloud & DevOps",
+    "cybersecurity": "Cybersecurity",
+    "cyber security": "Cybersecurity",
+    "security": "Cybersecurity",
+    "ai": "Artificial Intelligence",
+    "artificial intelligence": "Artificial Intelligence",
+    "machine learning": "Artificial Intelligence",
+    "computer science": "Computer Science",
+    "software engineering": "Software Engineering",
+    "data analysis": "Data Analysis",
+    "data": "Data Analysis",
+    "statistics": "Data Analysis",
+}
+
+
+def topics_in_category(category: str) -> list[str]:
+    return [entry["topic"] for entry in KNOWLEDGE_BASE if entry["category"] == category]
+
+
+def category_browse_answer(question: str) -> str | None:
+    q = normalise(question).rstrip("?.! ")
+    if len(q.split()) > 3:
+        return None
+    category = CATEGORY_ALIASES.get(q)
+    if not category:
+        return None
+    topics = topics_in_category(category)
+    listed = "\n".join(f"- {topic}" for topic in topics[:12])
+    return (
+        f"**{category}** is one of the areas I cover. Here are some specific topics you can ask "
+        f"me about directly:\n\n{listed}\n\n"
+        "Ask about any of these by name and I will give you a full answer."
+    )
+
 
 # =============================================================================
 # CONVERSATIONAL SMALL TALK
@@ -881,9 +938,8 @@ def match_knowledge_base(question: str) -> list[tuple[int, dict[str, Any]]]:
 
 def redirect_message() -> str:
     return (
-        "I don't have a verified answer to that in my knowledge base, and I would rather tell "
-        f"you that plainly than guess. Please redirect this question to **{HUMAN_AGENTS_LABEL}** "
-        "for accurate assistance."
+        "I will direct that question to **" + HUMAN_AGENTS_LABEL + "**, since it is not within "
+        "my current knowledge base. I would rather tell you that plainly than guess."
     )
 
 
@@ -1030,6 +1086,27 @@ def _search_wikipedia(query: str, limit: int = 3) -> list[dict[str, str]]:
     return results
 
 
+_LIVE_SEARCH_TRIGGERS = (
+    "find current", "find recent", "find github", "find repositories",
+    "find projects", "current github", "on github", "github projects",
+    "github repositories", "search github", "current research",
+    "recent research", "recent papers", "current papers", "current news",
+    "latest news", "latest version", "current projects", "search for",
+    "look up", "recent discussions", "current discussions",
+)
+
+
+def is_live_search_intent(question: str) -> bool:
+    """True when the question is explicitly asking to go and look something
+    up right now, as opposed to asking what something is. Definitional
+    questions ('what is Python') should still be answered from the
+    knowledge base even while live search is switched on; only an explicit
+    request like 'find current GitHub projects for X' should route to live
+    search instead of a keyword-matched knowledge-base topic."""
+    q = normalise(question)
+    return any(trigger in q for trigger in _LIVE_SEARCH_TRIGGERS)
+
+
 def run_live_search(question: str) -> list[dict[str, str]]:
     """Query a handful of public, unauthenticated sources. Results are only
     ever shown as attributed links, never rewritten into freestanding
@@ -1062,10 +1139,44 @@ def run_live_search(question: str) -> list[dict[str, str]]:
 # ANSWER ENGINE
 # =============================================================================
 
+def _format_live_results(evidence: list[dict[str, str]], as_primary: bool) -> str:
+    if as_primary:
+        lines = ["Here is what live search found:", ""]
+    else:
+        lines = [
+            "This is outside my verified knowledge base, so I am not going to state it as fact. "
+            "Live search did find some potentially relevant sources, which you should check "
+            f"yourself. I can also direct this question to **{HUMAN_AGENTS_LABEL}** if you would "
+            "prefer that instead:",
+            "",
+        ]
+    for item in evidence:
+        lines.append(f"- **{item['source']}** — [{item['title']}]({item['url']})")
+    return "\n".join(lines)
+
+
 def generate_answer(question: str, live_search_enabled: bool) -> tuple[str, list[dict[str, str]]]:
     conversational = find_conversation_response(question)
     if conversational:
         return conversational, []
+
+    # An explicit request to go look something up externally takes priority
+    # over a loose knowledge-base keyword match, so a question like "find
+    # current GitHub projects for Python data engineering" is not silently
+    # answered with the static definition of Python instead.
+    if is_live_search_intent(question):
+        if not live_search_enabled:
+            return (
+                "Live search is currently switched off, so I cannot go and look that up right "
+                "now. Turn on live search next to the message box if you would like me to search "
+                f"externally, or I will direct this question to **{HUMAN_AGENTS_LABEL}**.",
+                [],
+            )
+        evidence = run_live_search(question)
+        if evidence:
+            return _format_live_results(evidence, as_primary=True), evidence
+        # Fall through to the knowledge base and redirect logic below if
+        # live search itself came back empty.
 
     matches = match_knowledge_base(question)
 
@@ -1074,20 +1185,13 @@ def generate_answer(question: str, live_search_enabled: bool) -> tuple[str, list
         answer = build_kb_answer(matches[0][1], intent)
         return answer, []
 
-    evidence: list[dict[str, str]] = []
-    if live_search_enabled:
-        evidence = run_live_search(question)
+    browse = category_browse_answer(question)
+    if browse:
+        return browse, []
 
+    evidence = run_live_search(question) if live_search_enabled else []
     if evidence:
-        lines = [
-            "This is outside my verified knowledge base, so I am not going to state it as fact. "
-            "Live search did find some potentially relevant sources, which you should check "
-            f"yourself, and you can also redirect this question to **{HUMAN_AGENTS_LABEL}**:",
-            "",
-        ]
-        for item in evidence:
-            lines.append(f"- **{item['source']}** — [{item['title']}]({item['url']})")
-        return "\n".join(lines), evidence
+        return _format_live_results(evidence, as_primary=False), evidence
 
     return redirect_message(), []
 
@@ -1152,14 +1256,17 @@ with st.sidebar:
     )
 
     if st.button("＋ New chat", use_container_width=True, type="primary"):
-        st.session_state.conversation_id = create_conversation()
+        st.session_state.conversation_id = new_conversation_id()
         st.session_state.messages = []
         st.session_state.last_evidence = []
         st.rerun()
 
     st.divider()
     st.markdown("**Recent chats**")
-    for conversation in recent_conversations():
+    conversations = recent_conversations()
+    if not conversations:
+        st.caption("Your conversations will appear here once you send a message.")
+    for conversation in conversations:
         label = (conversation["title"] or "New conversation")[:38]
         if st.button(label, key=f"conv_{conversation['id']}", use_container_width=True):
             st.session_state.conversation_id = conversation["id"]
@@ -1168,42 +1275,16 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-    st.markdown("**Workspace**")
-    st.session_state.live_search_enabled = st.toggle(
-        "Enable supplementary live search",
-        value=st.session_state.live_search_enabled,
-        help=(
-            "Only used when a question is outside the knowledge base. Results are shown as "
-            "attributed links, never rewritten as confirmed facts."
-        ),
-    )
-
-    st.divider()
-    st.markdown("**Files**")
-    uploaded = st.file_uploader(
-        "Upload a file",
-        type=["csv", "xlsx", "xls", "json", "txt", "md"],
-        label_visibility="collapsed",
-    )
-    if uploaded is not None and st.session_state.uploaded_name != uploaded.name:
-        df, error = read_uploaded_file(uploaded)
-        if error:
-            st.error(error)
-        else:
-            st.session_state.uploaded_data = df
-            st.session_state.uploaded_name = uploaded.name
-
-    if st.session_state.uploaded_data is not None:
-        st.success(f"Loaded: {st.session_state.uploaded_name}")
-        if st.button("Clear file", use_container_width=True):
-            st.session_state.uploaded_data = None
-            st.session_state.uploaded_name = None
-            st.rerun()
-
-    st.divider()
     st.markdown("**Knowledge base**")
     st.caption(f"{len(KNOWLEDGE_BASE)} curated topics across {len(KNOWLEDGE_CATEGORIES)} categories.")
     st.caption(f"Anything outside this base is redirected to {HUMAN_AGENTS_LABEL}.")
+
+    st.divider()
+    st.markdown("**Support the developer**")
+    st.markdown(
+        "[💛 Sponsor on GitHub](https://github.com/sponsors/owino-brian)  \n"
+        "[🔗 Connect on LinkedIn](https://www.linkedin.com/in/owinobrian/)"
+    )
 
 
 # =============================================================================
@@ -1262,6 +1343,47 @@ if st.session_state.uploaded_data is not None:
         csv_bytes = st.session_state.uploaded_data.to_csv(index=False).encode("utf-8")
         st.download_button("Download cleaned CSV", data=csv_bytes, file_name="cleaned_data.csv", mime="text/csv")
 
+# ---- Compact toolbar right above the message box: attach + live search ----
+# This mirrors a Claude-style layout, where the attachment and search
+# controls sit next to the input instead of being buried in the sidebar.
+toolbar_left, toolbar_mid, toolbar_right = st.columns([0.09, 0.22, 0.69])
+
+with toolbar_left:
+    with st.popover("📎", use_container_width=True, help="Attach a file"):
+        st.markdown("**Attach a file**")
+        uploaded = st.file_uploader(
+            "Upload a file",
+            type=["csv", "xlsx", "xls", "json", "txt", "md"],
+            label_visibility="collapsed",
+            key="obo_file_uploader",
+        )
+        if uploaded is not None and st.session_state.uploaded_name != uploaded.name:
+            df, error = read_uploaded_file(uploaded)
+            if error:
+                st.error(error)
+            else:
+                st.session_state.uploaded_data = df
+                st.session_state.uploaded_name = uploaded.name
+                st.rerun()
+
+        if st.session_state.uploaded_data is not None:
+            st.success(f"Loaded: {st.session_state.uploaded_name}")
+            if st.button("Remove file", use_container_width=True):
+                st.session_state.uploaded_data = None
+                st.session_state.uploaded_name = None
+                st.rerun()
+
+with toolbar_mid:
+    st.session_state.live_search_enabled = st.toggle(
+        "🔍 Live search",
+        value=st.session_state.live_search_enabled,
+        help=(
+            "Only used when a question is outside the knowledge base, or when you explicitly "
+            "ask to find or search for something current. Results are shown as attributed "
+            "links, never rewritten as confirmed facts."
+        ),
+    )
+
 question = st.chat_input(f"Message {APP_TITLE}...")
 
 if question:
@@ -1269,10 +1391,11 @@ if question:
 
 if question:
     st.session_state.messages.append({"role": "user", "content": question})
-    save_message(st.session_state.conversation_id, "user", question)
 
     if len(st.session_state.messages) == 1:
-        update_conversation_title(st.session_state.conversation_id, question)
+        ensure_conversation_row(st.session_state.conversation_id, question)
+
+    save_message(st.session_state.conversation_id, "user", question)
 
     with st.chat_message("user"):
         st.markdown(question)
@@ -1293,6 +1416,8 @@ if question:
 
 st.markdown(
     f'<div class="obo-footer">{APP_TITLE} · Developer: {DEVELOPER} · '
-    f'Unanswered questions are redirected to {HUMAN_AGENTS_LABEL}</div>',
+    f'Unanswered questions are redirected to {HUMAN_AGENTS_LABEL}<br>'
+    f'<a href="https://github.com/sponsors/owino-brian" target="_blank">Support on GitHub</a> · '
+    f'<a href="https://www.linkedin.com/in/owinobrian/" target="_blank">LinkedIn</a></div>',
     unsafe_allow_html=True,
 )

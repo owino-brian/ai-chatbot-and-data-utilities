@@ -179,6 +179,17 @@ def initialise_database() -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS escalations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id TEXT NOT NULL,
+            question TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            emailed INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
     # A previous version of this app created a conversation row the moment
     # "New chat" was clicked, before any message existed, which is why the
     # sidebar could fill up with empty "New conversation" entries. This
@@ -254,6 +265,68 @@ def recent_conversations(limit: int = MAX_HISTORY_ITEMS) -> list[sqlite3.Row]:
     return rows
 
 
+def log_escalation(conversation_id: str, question: str) -> int:
+    stamp = now_string()
+    conn = get_connection()
+    cursor = conn.execute(
+        "INSERT INTO escalations (conversation_id, question, created_at, emailed) VALUES (?, ?, ?, 0)",
+        (conversation_id, question, stamp),
+    )
+    conn.commit()
+    escalation_id = cursor.lastrowid
+    conn.close()
+    return escalation_id
+
+
+def mark_escalation_emailed(escalation_id: int) -> None:
+    conn = get_connection()
+    conn.execute("UPDATE escalations SET emailed = 1 WHERE id = ?", (escalation_id,))
+    conn.commit()
+    conn.close()
+
+
+def send_to_human_agents(question: str, conversation_id: str) -> bool:
+    """Logs the escalated question locally (so nothing is lost even if
+    email delivery is not configured), then attempts to email it to
+    HUMAN_AGENT_EMAIL. Returns True only if the email genuinely sent.
+    Delivery needs SMTP_HOST, SMTP_USERNAME and SMTP_PASSWORD set as
+    Streamlit secrets or environment variables (SMTP_PORT defaults to 587);
+    without them this still records the escalation, it just does not
+    email it, and the caller is told the truth about which happened."""
+    escalation_id = log_escalation(conversation_id, question)
+
+    smtp_host = st.secrets.get("SMTP_HOST", os.getenv("SMTP_HOST", ""))
+    smtp_port = st.secrets.get("SMTP_PORT", os.getenv("SMTP_PORT", "587"))
+    smtp_username = st.secrets.get("SMTP_USERNAME", os.getenv("SMTP_USERNAME", ""))
+    smtp_password = st.secrets.get("SMTP_PASSWORD", os.getenv("SMTP_PASSWORD", ""))
+
+    if not (smtp_host and smtp_username and smtp_password):
+        return False
+
+    body = (
+        f"A visitor question was escalated from {APP_TITLE}.\n\n"
+        f"Conversation reference: {conversation_id}\n"
+        f"Time: {now_string()}\n\n"
+        f"Question:\n{question}\n\n"
+        "No further visitor contact details were collected by the app."
+    )
+    message = EmailMessage()
+    message["Subject"] = f"{APP_TITLE}: question escalated to human agents"
+    message["From"] = smtp_username
+    message["To"] = HUMAN_AGENT_EMAIL
+    message.set_content(body)
+
+    try:
+        with smtplib.SMTP(smtp_host, int(smtp_port), timeout=10) as server:
+            server.starttls()
+            server.login(smtp_username, smtp_password)
+            server.send_message(message)
+        mark_escalation_emailed(escalation_id)
+        return True
+    except Exception:
+        return False
+
+
 initialise_database()
 
 
@@ -275,6 +348,9 @@ if "uploaded_data" not in st.session_state:
 
 if "uploaded_name" not in st.session_state:
     st.session_state.uploaded_name = None
+
+if "pending_escalation" not in st.session_state:
+    st.session_state.pending_escalation = None
 
 if "last_evidence" not in st.session_state:
     st.session_state.last_evidence = []
@@ -1433,11 +1509,6 @@ with st.sidebar:
             st.session_state.messages = load_conversation(conversation["id"])
             st.session_state.last_evidence = []
             st.rerun()
-
-    st.divider()
-    st.markdown("**Knowledge base**")
-    st.caption(f"{len(KNOWLEDGE_BASE)} curated topics across {len(KNOWLEDGE_CATEGORIES)} categories.")
-    st.caption(f"Anything outside this base is redirected to {HUMAN_AGENTS_LABEL}.")
 
     st.divider()
     st.markdown("**Support the developer**")

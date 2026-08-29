@@ -15,7 +15,8 @@ Design principles
     behaviour that is not backed by one of those two sources.
 2.  Honest scope. If a question falls outside the knowledge base and live
     search (when enabled) returns nothing relevant, the chatbot says so
-    plainly and points the user to OBO Human Agents instead of guessing.
+    plainly, asks the visitor's permission to escalate, and only then
+    forwards the question to OBO Human Agents instead of guessing.
 3.  Browser-native GUI. Everything runs through Streamlit; there is no
     Tkinter or desktop GUI dependency, which keeps it deployable to any
     standard Streamlit host.
@@ -25,6 +26,16 @@ Design principles
     can be added on top of that if the deployer sets an optional API key
     (see the Google Custom Search section below), but nothing breaks
     without one.
+5.  Thread isolation. Each conversation is self-contained. Starting a new
+    chat, or switching to a different stored conversation, clears the
+    active file workspace and any pending escalation state so nothing from
+    one thread leaks into another.
+
+Internal reference only (never rendered in the UI): the knowledge base
+currently holds KNOWLEDGE_BASE_SIZE curated topics across
+len(KNOWLEDGE_CATEGORIES) categories. Counts like this are implementation
+detail for maintainers, not something a visitor needs to see on screen, so
+no card or label in this file should print them.
 
 This file requires Streamlit 1.43 or later. Two features used here landed
 together in that release: st.chat_input(accept_file=...), which gives the
@@ -39,9 +50,11 @@ import io
 import json
 import os
 import re
+import smtplib
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
@@ -56,9 +69,16 @@ import streamlit as st
 
 APP_TITLE = "OBO Chatbot"
 DEVELOPER = "Owino Brian Otieno"
-HUMAN_AGENTS_LABEL = "OBO Human Agents"
+DEVELOPER_TITLES = (
+    "Programmer, Technical Writer, Academic Writer and Author, "
+    "Software Documentation Specialist, and AI Trainer & Data Analyst"
+)
+DEVELOPER_EMAIL = "brianowino@gmail.com"
+DEVELOPER_GITHUB_URL = "https://github.com/owino-brian"
 DEVELOPER_SPONSOR_URL = "https://github.com/sponsors/owino-brian"
 DEVELOPER_LINKEDIN_URL = "https://www.linkedin.com/in/owinobrian/"
+HUMAN_AGENTS_LABEL = "OBO Human Agents"
+HUMAN_AGENT_EMAIL = "brianowino@gmail.com"
 DB_PATH = Path("obo_chatbot_history.db")
 MAX_UPLOAD_MB = 50
 MAX_HISTORY_ITEMS = 40
@@ -292,7 +312,13 @@ def send_to_human_agents(question: str, conversation_id: str) -> bool:
     Delivery needs SMTP_HOST, SMTP_USERNAME and SMTP_PASSWORD set as
     Streamlit secrets or environment variables (SMTP_PORT defaults to 587);
     without them this still records the escalation, it just does not
-    email it, and the caller is told the truth about which happened."""
+    email it, and the caller is told the truth about which happened.
+
+    The app does not collect a visitor's name, email or other contact
+    details, so "user details" here means the session's conversation
+    reference and timestamp rather than personal information. If a
+    deployment later collects visitor contact details, they should be
+    added to the body below."""
     escalation_id = log_escalation(conversation_id, question)
 
     smtp_host = st.secrets.get("SMTP_HOST", os.getenv("SMTP_HOST", ""))
@@ -308,7 +334,8 @@ def send_to_human_agents(question: str, conversation_id: str) -> bool:
         f"Conversation reference: {conversation_id}\n"
         f"Time: {now_string()}\n\n"
         f"Question:\n{question}\n\n"
-        "No further visitor contact details were collected by the app."
+        "No visitor name, email or other contact details were collected by the app; the "
+        "conversation reference above is the only way to trace this session."
     )
     message = EmailMessage()
     message["Subject"] = f"{APP_TITLE}: question escalated to human agents"
@@ -334,6 +361,18 @@ initialise_database()
 # SESSION STATE
 # =============================================================================
 
+def reset_thread_state() -> None:
+    """Clears everything that is specific to a single conversation thread:
+    the active file workspace, any evidence from the last live search, and
+    any escalation question awaiting a yes/no reply. Called whenever a new
+    chat is started or a different stored conversation is opened, so a
+    file or a pending escalation from one thread never leaks into another."""
+    st.session_state.uploaded_data = None
+    st.session_state.uploaded_name = None
+    st.session_state.last_evidence = []
+    st.session_state.pending_escalation = None
+
+
 if "conversation_id" not in st.session_state:
     st.session_state.conversation_id = new_conversation_id()
 
@@ -350,6 +389,8 @@ if "uploaded_name" not in st.session_state:
     st.session_state.uploaded_name = None
 
 if "pending_escalation" not in st.session_state:
+    # None, or the exact question text awaiting a yes/no reply from the
+    # visitor about forwarding it to OBO Human Agents.
     st.session_state.pending_escalation = None
 
 if "last_evidence" not in st.session_state:
@@ -363,12 +404,24 @@ if "last_evidence" not in st.session_state:
 # accurate on its own without needing an external model to "fill in the
 # gaps". This is what makes the assistant's answers trustworthy: if a topic
 # is not represented here (and live search is off, or also comes up empty),
-# the assistant redirects to OBO Human Agents instead of guessing.
+# the assistant asks permission and redirects to OBO Human Agents instead
+# of guessing.
 #
 # Each record: (topic, category, keywords, answer)
 # =============================================================================
 
 _KB_RECORDS: list[tuple[str, str, tuple[str, ...], str]] = [
+    # ---- About the developer ---------------------------------------------------
+    ("Owino Brian Otieno", "About the Developer",
+     ("owino brian otieno", "owino brian", "brian otieno", "xerxes brian tech", "the developer",
+      "developer of this app", "developer of obo chatbot"),
+     f"{DEVELOPER} is the developer of {APP_TITLE}, operating under the brand Xerxes Brian Tech. "
+     f"He works as a {DEVELOPER_TITLES}.\n\n"
+     f"- Email: {DEVELOPER_EMAIL}\n"
+     f"- GitHub: {DEVELOPER_GITHUB_URL}\n"
+     f"- LinkedIn: {DEVELOPER_LINKEDIN_URL}\n"
+     f"- Sponsor the project: {DEVELOPER_SPONSOR_URL}"),
+
     # ---- Programming languages -------------------------------------------------
     ("Python", "Programming Languages", ("python", "pip", "virtualenv", "venv"),
      "Python is a general-purpose, interpreted programming language used in web development, "
@@ -765,6 +818,10 @@ _KB_RECORDS: list[tuple[str, str, tuple[str, ...], str]] = [
     ("System design", "Software Engineering", ("system design", "software architecture"),
      "System design starts from requirements and constraints, then works through components, "
      "data flow, scalability, reliability, security and operational concerns."),
+    ("Software documentation", "Software Engineering", ("software documentation", "technical documentation", "api documentation"),
+     "Software documentation explains how a system works and how to use it, spanning README files, "
+     "API references, architecture notes and user guides. Good documentation is kept current as "
+     "the software changes, not written once and left to go stale."),
 
     # ---- Data analysis and tooling ----------------------------------------------
     ("Data cleaning", "Data Analysis", ("data cleaning", "data cleansing"),
@@ -909,6 +966,7 @@ KNOWLEDGE_BASE: list[dict[str, Any]] = [
 ]
 
 KNOWLEDGE_CATEGORIES: list[str] = sorted({entry["category"] for entry in KNOWLEDGE_BASE})
+KNOWLEDGE_BASE_SIZE: int = len(KNOWLEDGE_BASE)  # internal reference only, never shown in the UI
 
 # When someone types a single broad word or short phrase rather than a
 # specific question ("research", "cloud", "cybersecurity"), it is more
@@ -942,6 +1000,8 @@ CATEGORY_ALIASES: dict[str, str] = {
     "data analysis": "Data Analysis",
     "data": "Data Analysis",
     "statistics": "Data Analysis",
+    "about the developer": "About the Developer",
+    "developer": "About the Developer",
 }
 
 
@@ -970,30 +1030,51 @@ def category_browse_answer(question: str) -> str | None:
 # =============================================================================
 
 _CONVERSATION_PATTERNS: list[tuple[tuple[str, ...], str]] = [
-    (("hello", "hi", "hey", "hiya", "greetings"),
+    (("hello", "hi", "hey", "hiya", "greetings", "yo", "sup", "howdy", "hi there", "hello there",
+      "good day", "salutations"),
      f"Hello! I am **{APP_TITLE}**. I can help with programming, web development, databases, "
      "cloud and DevOps, cybersecurity, AI and machine learning, computer science fundamentals, "
      "data analysis and academic research and referencing. What would you like to work on?"),
-    (("good morning",), f"Good morning! I am **{APP_TITLE}**. What can I help you with today?"),
-    (("good afternoon",), f"Good afternoon! I am **{APP_TITLE}**. What would you like to work on?"),
-    (("good evening",), f"Good evening! I am **{APP_TITLE}**. What can I help you with?"),
-    (("who are you", "what are you"),
-     f"I am **{APP_TITLE}**, a knowledge-base-driven assistant built by {DEVELOPER} for "
-     "technology, computer science, AI and academic research questions. I only answer from a "
-     "curated knowledge base (plus optional live search results), so I never guess."),
-    (("what can you do", "what do you do", "capabilities"),
+    (("good morning", "morning"), f"Good morning! I am **{APP_TITLE}**. What can I help you with today?"),
+    (("good afternoon", "afternoon"), f"Good afternoon! I am **{APP_TITLE}**. What would you like to work on?"),
+    (("good evening", "evening"), f"Good evening! I am **{APP_TITLE}**. What can I help you with?"),
+    (("who are you", "what are you", "introduce yourself", "tell me about yourself"),
+     f"I am **{APP_TITLE}**, a knowledge-base-driven assistant developed by **{DEVELOPER}**, a "
+     f"{DEVELOPER_TITLES}. I only answer from a curated knowledge base (plus optional live search "
+     "results), so I never guess.\n\n"
+     f"- Email: {DEVELOPER_EMAIL}\n"
+     f"- GitHub: {DEVELOPER_GITHUB_URL}\n"
+     f"- LinkedIn: {DEVELOPER_LINKEDIN_URL}"),
+    (("what can you do", "what do you do", "capabilities", "how can you help", "how can you help me",
+      "what can you help with", "what do you know"),
      "I can explain concepts, compare technologies, walk through debugging approaches, discuss "
      "software architecture and academic methodology, and work with files you upload. If a "
-     f"question is outside my knowledge base, I will say so and point you to {HUMAN_AGENTS_LABEL} "
-     "instead of guessing."),
-    (("how are you", "how is it going"),
+     f"question is outside my knowledge base, I will say so and, with your permission, forward it "
+     f"to {HUMAN_AGENTS_LABEL} instead of guessing."),
+    (("how are you", "how is it going", "how are things", "how's it going", "what's up", "whats up",
+      "how are you doing"),
      "Ready to help. Send me a question, a piece of code, a research problem or a dataset."),
-    (("thank you", "thanks"), "You're welcome. Send the next question whenever you are ready."),
-    (("bye", "goodbye", "see you"), "Goodbye. You can start a new conversation any time."),
-    (("who is your developer", "who developed you", "who created you", "who made you", "who built you"),
-     f"I was built by **{DEVELOPER}**. You can support the work or get in touch here:\n\n"
-     f"- Sponsor on GitHub: {DEVELOPER_SPONSOR_URL}\n"
-     f"- LinkedIn: {DEVELOPER_LINKEDIN_URL}"),
+    (("thank you", "thanks", "thank you so much", "thanks a lot", "much appreciated", "appreciate it",
+      "cheers"),
+     "You're welcome. Send the next question whenever you are ready."),
+    (("you're welcome", "no problem", "no worries"),
+     "Glad to help. What else can I do for you?"),
+    (("bye", "goodbye", "see you", "see you later", "farewell", "later", "gotta go"),
+     "Goodbye. You can start a new conversation any time."),
+    (("please", "help", "i need help", "can you help me", "help me"),
+     "Of course. Tell me what you are working on and I will do my best to help."),
+    (("sorry", "my apologies", "my bad"),
+     "No need to apologise. What would you like to ask?"),
+    (("ok", "okay", "cool", "nice", "great", "awesome", "sounds good", "got it", "understood",
+      "alright"),
+     "Understood. What else can I help you with?"),
+    (("who is your developer", "who developed you", "who created you", "who made you", "who built you",
+      "who owns you", "who is behind this", "who runs this"),
+     f"I was built by **{DEVELOPER}**, a {DEVELOPER_TITLES}.\n\n"
+     f"- Email: {DEVELOPER_EMAIL}\n"
+     f"- GitHub: {DEVELOPER_GITHUB_URL}\n"
+     f"- LinkedIn: {DEVELOPER_LINKEDIN_URL}\n"
+     f"- Sponsor the project: {DEVELOPER_SPONSOR_URL}"),
 ]
 
 
@@ -1064,13 +1145,6 @@ def match_knowledge_base(question: str) -> list[tuple[int, dict[str, Any]]]:
     return scored
 
 
-def redirect_message() -> str:
-    return (
-        "I will direct that question to **" + HUMAN_AGENTS_LABEL + "**, since it is not within "
-        "my current knowledge base. I would rather tell you that plainly than guess."
-    )
-
-
 def build_kb_answer(entry: dict[str, Any], intent: str) -> str:
     name = entry["topic"]
     base = entry["answer"]
@@ -1113,6 +1187,65 @@ def build_kb_answer(entry: dict[str, Any], intent: str) -> str:
             "relevant part of this in more detail."
         )
     return f"### {name}\n\n{base}"
+
+
+# =============================================================================
+# HUMAN-AGENT ESCALATION (ask permission first, never a silent redirect)
+# =============================================================================
+
+_AFFIRMATIVE_REPLIES = (
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "please", "please do", "go ahead",
+    "affirmative", "correct", "send it", "forward it", "do it",
+)
+_NEGATIVE_REPLIES = (
+    "no", "nope", "nah", "not now", "no thanks", "negative", "don't", "do not", "never mind",
+    "cancel", "skip it",
+)
+
+
+def classify_yes_no(text: str) -> str | None:
+    """Reads a reply to the escalation prompt and returns 'yes', 'no', or
+    None if the reply is not a clear answer to that yes/no question."""
+    q = normalise(text).rstrip("?.! ")
+    if q in _AFFIRMATIVE_REPLIES or any(q.startswith(word) for word in _AFFIRMATIVE_REPLIES):
+        return "yes"
+    if q in _NEGATIVE_REPLIES or any(q.startswith(word) for word in _NEGATIVE_REPLIES):
+        return "no"
+    return None
+
+
+def escalation_prompt_message() -> str:
+    return (
+        "I am sorry, but this question falls outside my current knowledge base, and I would "
+        "rather say so plainly than guess or risk giving you inaccurate information.\n\n"
+        f"Would you like me to forward this question to **{HUMAN_AGENTS_LABEL}**? Please reply "
+        "yes or no."
+    )
+
+
+def escalation_confirmed_message() -> str:
+    return (
+        f"I have forwarded your question to **{HUMAN_AGENTS_LABEL}**. Do you have any other "
+        "question while you wait for a response?"
+    )
+
+
+def escalation_declined_message() -> str:
+    topics_overview = "\n".join(f"- {category}" for category in KNOWLEDGE_CATEGORIES)
+    return (
+        "Okay. I am sorry, I cannot respond to a question outside my knowledge base, since I "
+        "would rather avoid guesswork and hallucination.\n\n"
+        "Here is what I can help you with instead:\n\n"
+        f"{topics_overview}\n\n"
+        "What other question do you have?"
+    )
+
+
+def escalation_reply_unclear_message() -> str:
+    return (
+        "Sorry, I did not catch a clear yes or no there. Would you like me to forward your "
+        f"question to **{HUMAN_AGENTS_LABEL}**? Please reply yes or no."
+    )
 
 
 # =============================================================================
@@ -1191,6 +1324,25 @@ def _search_crossref(query: str, limit: int = 3) -> list[dict[str, str]]:
         doi = item.get("DOI")
         url = f"https://doi.org/{doi}" if doi else "https://www.crossref.org/"
         results.append({"source": "Crossref", "title": title, "summary": "Scholarly publication metadata.", "url": url})
+    return results
+
+
+def _search_openalex(query: str, limit: int = 3) -> list[dict[str, str]]:
+    response = _safe_get(
+        "https://api.openalex.org/works",
+        {"search": query[:180], "per_page": limit},
+    )
+    if response is None:
+        return []
+    try:
+        data = response.json()
+    except ValueError:
+        return []
+    results = []
+    for item in data.get("results", [])[:limit]:
+        title = item.get("display_name") or "Scholarly work"
+        url = item.get("id") or "https://openalex.org/"
+        results.append({"source": "OpenAlex", "title": title, "summary": "Scholarly publication record.", "url": url})
     return results
 
 
@@ -1339,10 +1491,10 @@ def run_live_search(question: str) -> list[dict[str, str]]:
     """Query a handful of public sources. Results are only ever shown as
     attributed links, never rewritten into freestanding factual claims,
     which is what keeps this feature hallucination-free. This checks
-    developer/technical sources, academic sources, a general-web source
-    (DuckDuckGo, plus real Google results if the deployer has configured
-    an API key), community/social discussion (Reddit) and finally
-    Wikipedia as a fallback."""
+    developer/technical sources, academic sources (Crossref and OpenAlex),
+    a general-web source (DuckDuckGo, plus real Google results if the
+    deployer has configured an API key), community/social discussion
+    (Reddit) and finally Wikipedia as a fallback."""
     q = normalise(question)
     results: list[dict[str, str]] = []
 
@@ -1352,6 +1504,7 @@ def run_live_search(question: str) -> list[dict[str, str]]:
 
     if any(x in q for x in ("research", "paper", "study", "literature", "journal", "academic")):
         results.extend(_search_crossref(question))
+        results.extend(_search_openalex(question))
 
     results.extend(_search_google_custom(question))
     results.extend(_search_duckduckgo(question))
@@ -1375,26 +1528,22 @@ def run_live_search(question: str) -> list[dict[str, str]]:
 # ANSWER ENGINE
 # =============================================================================
 
-def _format_live_results(evidence: list[dict[str, str]], as_primary: bool) -> str:
-    if as_primary:
-        lines = ["Here is what live search found:", ""]
-    else:
-        lines = [
-            "This is outside my verified knowledge base, so I am not going to state it as fact. "
-            "Live search did find some potentially relevant sources, which you should check "
-            f"yourself. I can also direct this question to **{HUMAN_AGENTS_LABEL}** if you would "
-            "prefer that instead:",
-            "",
-        ]
+def _format_live_results(evidence: list[dict[str, str]]) -> str:
+    lines = ["Here is what live search found:", ""]
     for item in evidence:
         lines.append(f"- **{item['source']}** — [{item['title']}]({item['url']})")
     return "\n".join(lines)
 
 
-def generate_answer(question: str, live_search_enabled: bool) -> tuple[str, list[dict[str, str]]]:
+def generate_answer(question: str, live_search_enabled: bool) -> tuple[str, list[dict[str, str]], bool]:
+    """Returns (answer_text, evidence, needs_escalation). needs_escalation is
+    True only when the question is genuinely outside the knowledge base
+    (and live search, if enabled, found nothing useful either); the caller
+    is then responsible for asking the visitor's permission before any
+    question is forwarded to a human agent."""
     conversational = find_conversation_response(question)
     if conversational:
-        return conversational, []
+        return conversational, [], False
 
     # An explicit request to go look something up externally takes priority
     # over a loose knowledge-base keyword match, so a question like "find
@@ -1405,13 +1554,14 @@ def generate_answer(question: str, live_search_enabled: bool) -> tuple[str, list
             return (
                 "Live search is currently switched off, so I cannot go and look that up right "
                 "now. Turn on live search next to the message box if you would like me to search "
-                f"externally, or I will direct this question to **{HUMAN_AGENTS_LABEL}**.",
+                "externally.",
                 [],
+                False,
             )
         evidence = run_live_search(question)
         if evidence:
-            return _format_live_results(evidence, as_primary=True), evidence
-        # Fall through to the knowledge base and redirect logic below if
+            return _format_live_results(evidence), evidence, False
+        # Fall through to the knowledge base and escalation logic below if
         # live search itself came back empty.
 
     matches = match_knowledge_base(question)
@@ -1419,17 +1569,23 @@ def generate_answer(question: str, live_search_enabled: bool) -> tuple[str, list
     if matches and matches[0][0] >= MIN_MATCH_SCORE:
         intent = detect_intent(question)
         answer = build_kb_answer(matches[0][1], intent)
-        return answer, []
+        return answer, [], False
 
     browse = category_browse_answer(question)
     if browse:
-        return browse, []
+        return browse, [], False
 
     evidence = run_live_search(question) if live_search_enabled else []
     if evidence:
-        return _format_live_results(evidence, as_primary=False), evidence
+        return (
+            "This is outside my verified knowledge base, so I am not going to state it as fact. "
+            "Live search did find some potentially relevant sources, which you should check "
+            "yourself:\n\n" + _format_live_results(evidence),
+            evidence,
+            False,
+        )
 
-    return redirect_message(), []
+    return escalation_prompt_message(), [], True
 
 
 # =============================================================================
@@ -1494,7 +1650,7 @@ with st.sidebar:
     if st.button("＋ New chat", use_container_width=True, type="primary"):
         st.session_state.conversation_id = new_conversation_id()
         st.session_state.messages = []
-        st.session_state.last_evidence = []
+        reset_thread_state()
         st.rerun()
 
     st.divider()
@@ -1507,7 +1663,7 @@ with st.sidebar:
         if st.button(label, key=f"conv_{conversation['id']}", use_container_width=True):
             st.session_state.conversation_id = conversation["id"]
             st.session_state.messages = load_conversation(conversation["id"])
-            st.session_state.last_evidence = []
+            reset_thread_state()
             st.rerun()
 
     st.divider()
@@ -1642,10 +1798,31 @@ if question or attachment_summary or attachment_error:
             parts.append(attachment_error)
         elif attachment_summary:
             parts.append(attachment_summary)
+
         if question:
-            with st.spinner("Checking the knowledge base..."):
-                text_answer, evidence = generate_answer(question, st.session_state.live_search_enabled)
-            parts.append(text_answer)
+            if st.session_state.pending_escalation:
+                # This message is a reply to "would you like me to forward
+                # this to a human agent?", not a fresh question.
+                pending_question = st.session_state.pending_escalation
+                decision = classify_yes_no(question)
+                if decision == "yes":
+                    send_to_human_agents(pending_question, st.session_state.conversation_id)
+                    parts.append(escalation_confirmed_message())
+                    st.session_state.pending_escalation = None
+                elif decision == "no":
+                    parts.append(escalation_declined_message())
+                    st.session_state.pending_escalation = None
+                else:
+                    parts.append(escalation_reply_unclear_message())
+            else:
+                with st.spinner("Checking the knowledge base..."):
+                    text_answer, evidence, needs_escalation = generate_answer(
+                        question, st.session_state.live_search_enabled
+                    )
+                if needs_escalation:
+                    st.session_state.pending_escalation = question
+                parts.append(text_answer)
+
         answer = "\n\n".join(parts)
         st.markdown(answer)
         if evidence:
@@ -1660,7 +1837,7 @@ if question or attachment_summary or attachment_error:
 
 st.markdown(
     f'<div class="obo-footer">{APP_TITLE} · Developer: {DEVELOPER} · '
-    f'Unanswered questions are redirected to {HUMAN_AGENTS_LABEL}<br>'
+    f'Unanswered questions are only sent to {HUMAN_AGENTS_LABEL} with your permission<br>'
     f'<a href="{DEVELOPER_SPONSOR_URL}" target="_blank">Support on GitHub</a> · '
     f'<a href="{DEVELOPER_LINKEDIN_URL}" target="_blank">LinkedIn</a></div>',
     unsafe_allow_html=True,

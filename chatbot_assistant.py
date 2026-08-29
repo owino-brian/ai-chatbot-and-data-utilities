@@ -1,456 +1,1049 @@
 """
-================================================================================
-Enterprise Technical Suite: Stateful AI Chatbot & ETL Data Pipeline
+Enterprise Technical Suite
+Streamlit edition - web/cloud safe
 Developer: Owino Brian Otieno
-Format: Professional Graphical User Interface (GUI)
-================================================================================
+
+Key design goals:
+- No tkinter/Tk dependencies.
+- Streamlit-native graphical interface.
+- SQLite persistence for local application data.
+- Live public data retrieval from several research/developer APIs.
+- Optional AI provider for broad natural-language answers.
+- CSV/Excel/JSON ETL utilities.
+- Research-oriented citations/links in the UI.
 """
 
+import io
+import json
+import os
 import re
+import sqlite3
 import time
 import uuid
-import json
-import logging
-import random
-import threading
-import tkinter as tk
-from tkinter import ttk, scrolledtext
-from datetime import datetime
-from typing import Dict, List, Tuple, Any, Optional
-from dataclasses import dataclass, field
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-# ==============================================================================
-# CONFIGURATION & LOGGING
-# ==============================================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+import pandas as pd
+import requests
+import streamlit as st
+
+
+# =============================================================================
+# APP CONFIGURATION
+# =============================================================================
+
+st.set_page_config(
+    page_title="Owino Brian | Enterprise Technical Suite",
+    page_icon="🧠",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
-logger = logging.getLogger("OwinoBrianSuite")
 
-# ==============================================================================
-# DATA MODELS
-# ==============================================================================
-@dataclass
-class ConversationContext:
-    session_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
-    user_name: str = "Client"
-    current_topic: Optional[str] = None
-    turn_count: int = 0
-    history: List[Dict[str, str]] = field(default_factory=list)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+APP_NAME = "Owino Brian Enterprise Technical Suite"
+DB_PATH = "enterprise_suite.db"
+HTTP_TIMEOUT = 12
 
-@dataclass
-class IntentMatch:
-    intent_name: str
-    confidence: float
-    response_template: str
-    entities: Dict[str, str]
+TECH_CATEGORIES = {
+    "Artificial Intelligence": [
+        "machine learning", "deep learning", "large language models",
+        "generative AI", "RAG", "AI agents", "computer vision",
+        "natural language processing", "reinforcement learning",
+        "MLOps", "embeddings", "vector databases"
+    ],
+    "Software Development": [
+        "Python", "JavaScript", "TypeScript", "Java", "C++", "C#",
+        "Go", "Rust", "PHP", "Django", "FastAPI", "Flask",
+        "React", "Next.js", "Node.js", "Spring Boot"
+    ],
+    "Data Engineering": [
+        "SQL", "PostgreSQL", "MySQL", "MongoDB", "Redis",
+        "Apache Spark", "Apache Kafka", "Airflow", "dbt",
+        "Pandas", "Polars", "ETL", "ELT", "data warehouse"
+    ],
+    "Cloud & DevOps": [
+        "AWS", "Azure", "Google Cloud", "Docker", "Kubernetes",
+        "Terraform", "GitHub Actions", "GitLab CI", "CI/CD",
+        "serverless", "observability", "Infrastructure as Code"
+    ],
+    "Cybersecurity": [
+        "OAuth", "JWT", "TLS", "encryption", "zero trust",
+        "IAM", "penetration testing", "threat modelling",
+        "vulnerability management", "secure coding"
+    ],
+    "Academic & Research": [
+        "research methodology", "literature review", "systematic review",
+        "qualitative research", "quantitative research", "statistics",
+        "machine learning research", "computer science", "IEEE",
+        "Harvard referencing", "thesis", "dissertation"
+    ],
+    "General Computing": [
+        "algorithms", "data structures", "operating systems",
+        "computer networks", "databases", "distributed systems",
+        "software engineering", "computer architecture"
+    ],
+}
 
-# ==============================================================================
-# DATA CLEANING PIPELINE ENGINE
-# ==============================================================================
-class StructuredDataPipeline:
-    """Automated data cleaning and transformation pipeline."""
-    
-    @staticmethod
-    def clean_client_dataset(raw_data: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-        cleaned_records: List[Dict[str, Any]] = []
-        metrics = {
-            "total_processed": len(raw_data),
-            "successful_records": 0,
-            "invalid_emails_fixed": 0,
-            "missing_fields_defaulted": 0
-        }
 
-        for record in raw_data:
-            normalized = {k.strip().lower().replace(" ", "_"): v for k, v in record.items()}
-            
-            raw_name = str(normalized.get("client_name", "Unknown")).strip()
-            clean_name = re.sub(r"[^\w\s\.-]", "", raw_name).title()
-            
-            raw_email = str(normalized.get("email", "")).strip().lower()
-            email_pattern = r"^[\w\.-]+@[\w\.-]+\.\w+$"
-            if not re.match(email_pattern, raw_email):
-                # Branding replacement
-                clean_email = f"unverified_{uuid.uuid4().hex[:6]}@owinobrian.com"
-                metrics["invalid_emails_fixed"] += 1
-            else:
-                clean_email = raw_email
-                
-            try:
-                budget = float(normalized.get("budget_usd", 0.0))
-            except (ValueError, TypeError):
-                budget = 0.0
-                metrics["missing_fields_defaulted"] += 1
+# =============================================================================
+# DATABASE
+# =============================================================================
 
-            cleaned_record = {
-                "record_id": str(uuid.uuid4()),
-                "client_name": clean_name,
-                "email": clean_email,
-                "budget_usd": round(budget, 2),
-                "tech_stack": [t.strip().upper() for t in str(normalized.get("tech_stack", "")).split(",") if t.strip()],
-                "processed_at": datetime.utcnow().isoformat() + "Z",
-                "routed_to": "owinobrian_infrastructure"
-            }
-            
-            cleaned_records.append(cleaned_record)
-            metrics["successful_records"] += 1
-            
-        return cleaned_records, metrics
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-# ==============================================================================
-# HIGHLY INTELLIGENT INTENT ENGINE
-# ==============================================================================
-class IntentEngine:
-    """Expanded Rule-based fuzzy/pattern engine for wide technical coverage."""
-    
-    def __init__(self):
-        self._knowledge_base = {
-            "greetings": {
-                "keywords": [r"\bhello\b", r"\bhi\b", r"\bhey\b", r"\bgreetings\b", r"\bstart\b", r"\bmorning\b", r"\bevening\b"],
-                "responses": [
-                    "Greetings! I am the automated intelligence module designed by Owino Brian. How can I accelerate your engineering workflows today?",
-                    "Hello there! I am ready to assist you with tech stack architectures, data pipelines, DevOps, or consulting deliverables.",
-                    "Welcome! Let's build something exceptional. Do you have a question about machine learning, cloud architecture, or data engineering?"
-                ]
-            },
-            "creator_info": {
-                "keywords": [r"\bowino\b", r"\bbrian\b", r"\bcreator\b", r"\bwho made you\b", r"\bdeveloper\b", r"\bowner\b"],
-                "responses": [
-                    "I was architected and developed by Owino Brian Otieno, an expert in engineering robust software systems and AI integrations.",
-                    "Owino Brian engineered my core modules, ensuring I deliver highly accurate, low-latency technical responses.",
-                    "My systems run on infrastructure designed by Owino Brian Otieno. If you need bespoke solutions, you are speaking to his digital proxy!"
-                ]
-            },
-            "data_pipeline": {
-                "keywords": [r"\bdata\b", r"\bcleaning\b", r"\betl\b", r"\bpipeline\b", r"\bpandas\b", r"\bsql\b", r"\bbig data\b", r"\bspark\b"],
-                "responses": [
-                    "Our enterprise data pipelines utilize robust batch and stream processing with strict schema validation. Run the 'ETL' module in this app to see a demo.",
-                    "Owino Brian builds self-healing ETL architectures that automatically flag data anomalies, sanitize fields, and route cleanly into highly available data warehouses.",
-                    "For data ingestion, we recommend a decoupled architecture using Apache Kafka or AWS Kinesis, piped into Python (Pandas/Polars) transformers."
-                ]
-            },
-            "machine_learning": {
-                "keywords": [r"\bai\b", r"\bml\b", r"\bmachine learning\b", r"\bmodel\b", r"\btensorflow\b", r"\bpytorch\b", r"\bllm\b", r"\bpredict\b"],
-                "responses": [
-                    "Implementing Machine Learning? We leverage PyTorch and TensorFlow for deep learning, optimizing models with TensorRT for rapid inference.",
-                    "Generative AI and LLM integration is a core competency. We can deploy scalable Retrieval-Augmented Generation (RAG) systems for your enterprise.",
-                    "From predictive analytics to computer vision, Owino Brian's AI architectures ensure scalable training and low-latency deployments."
-                ]
-            },
-            "devops_cloud": {
-                "keywords": [r"\bcloud\b", r"\baws\b", r"\bazure\b", r"\bgcp\b", r"\bdocker\b", r"\bkubernetes\b", r"\bci/cd\b", r"\bdeploy\b", r"\bserverless\b"],
-                "responses": [
-                    "We embrace GitOps and Infrastructure as Code (IaC) using Terraform. Everything is containerized with Docker and orchestrated via Kubernetes.",
-                    "For CI/CD pipelines, we automate testing and deployment via GitHub Actions or GitLab CI, ensuring zero-downtime rollouts.",
-                    "Cloud architecture is scalable by default. We design multi-AZ, serverless infrastructures on AWS/GCP tailored to handle immense throughput."
-                ]
-            },
-            "web_development": {
-                "keywords": [r"\bweb\b", r"\bfrontend\b", r"\bbackend\b", r"\breact\b", r"\bapi\b", r"\bdjango\b", r"\bfastapi\b", r"\bnode\b"],
-                "responses": [
-                    "Our backend systems are typically built with high-performance frameworks like FastAPI or Django, heavily optimized for asynchronous requests.",
-                    "For web frontends, we deploy responsive, state-managed applications using React or Vue.js, communicating securely with RESTful or GraphQL APIs.",
-                    "Microservices are key. Owino Brian architects decoupled APIs that allow frontend and backend teams to iterate completely independently."
-                ]
-            },
-            "cybersecurity": {
-                "keywords": [r"\bsecurity\b", r"\bhack\b", r"\bauth\b", r"\boauth\b", r"\bjwt\b", r"\bencryption\b", r"\bfirewall\b"],
-                "responses": [
-                    "Security is paramount. We implement OAuth2.0, robust JWT validation, and at-rest/in-transit encryption across all microservices.",
-                    "All infrastructures built by Owino Brian undergo rigorous threat modeling, ensuring strict IAM policies and zero-trust networking principles."
-                ]
-            },
-            "chatbot_architecture": {
-                "keywords": [r"\bbot\b", r"\bchatbot\b", r"\bagent\b", r"\bnlp\b", r"\barchitecture\b", r"\bhow do you work\b"],
-                "responses": [
-                    "I operate on a highly structured, stateful intent architecture. I preserve session state and support scalable microservice hooks.",
-                    "This system uses an advanced regex-based NLP pattern matcher crafted by Owino Brian, easily extensible to connect to an LLM provider."
-                ]
-            },
-            "consulting_pricing": {
-                "keywords": [r"\bcost\b", r"\bprice\b", r"\bconsulting\b", r"\bhire\b", r"\brate\b", r"\bschedule\b", r"\bcontract\b"],
-                "responses": [
-                    "Owino Brian offers specialized, milestone-based consulting for high-level data architecture, AI development, and software engineering.",
-                    "Project scopes depend on technical complexity. Please reach out to Owino Brian for a detailed Statement of Work (SOW) and discovery phase."
-                ]
-            },
-            "documentation_standards": {
-                "keywords": [r"\bdoc(s)?\b", r"\bdocumentation\b", r"\bswagger\b", r"\bmarkdown\b", r"\breadme\b"],
-                "responses": [
-                    "We adhere to strict OpenAPI specifications and Markdown documentation standards. Clear system specs reduce developer onboarding time by over 50%.",
-                    "Every output generated by Owino Brian's systems follows production-grade documentation patterns for seamless developer handoffs."
-                ]
-            }
-        }
 
-    def evaluate(self, user_input: str) -> IntentMatch:
-        normalized = user_input.lower().strip()
-        best_intent = "unknown"
-        highest_score = 0.0
+def init_db() -> None:
+    conn = db()
+    cur = conn.cursor()
 
-        for intent_name, data in self._knowledge_base.items():
-            matches = sum(1 for pattern in data["keywords"] if re.search(pattern, normalized))
-            
-            if matches > 0:
-                score = min(0.4 + (matches * 0.25), 0.99)
-                if score > highest_score:
-                    highest_score = score
-                    best_intent = intent_name
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            intent TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
 
-        if best_intent != "unknown":
-            response = random.choice(self._knowledge_base[best_intent]["responses"])
-        else:
-            response = "That is a highly specific inquiry. I have logged the metrics for Owino Brian's senior solutions team to review. Can we discuss your backend, cloud, or AI needs in the meantime?"
-            highest_score = 0.15
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS research_cache (
+            cache_key TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            query TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
 
-        # Detect specific technologies mentioned by the user
-        entities = {}
-        found_tech = re.findall(r"\b(python|pandas|sql|aws|docker|fastapi|react|kafka|kubernetes|azure|ai)\b", normalized)
-        if found_tech:
-            entities["detected_technologies"] = ", ".join(set([t.upper() for t in found_tech]))
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            rating INTEGER,
+            comment TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
 
-        return IntentMatch(
-            intent_name=best_intent,
-            confidence=highest_score,
-            response_template=response,
-            entities=entities
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS knowledge_base (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            description TEXT NOT NULL,
+            keywords TEXT NOT NULL
+        )
+    """)
+
+    # Seed a broad local knowledge catalogue once.
+    cur.execute("SELECT COUNT(*) FROM knowledge_base")
+    if cur.fetchone()[0] == 0:
+        rows = []
+        for category, topics in TECH_CATEGORIES.items():
+            for topic in topics:
+                rows.append((
+                    category,
+                    topic,
+                    f"Reference topic in {category}: {topic}.",
+                    json.dumps([topic.lower(), category.lower()])
+                ))
+        cur.executemany(
+            "INSERT INTO knowledge_base(category, topic, description, keywords) "
+            "VALUES (?, ?, ?, ?)",
+            rows,
         )
 
-# ==============================================================================
-# STATEFUL CHATBOT CONTROLLER
-# ==============================================================================
-class TechnicalSupportChatbot:
-    """Stateful Technical Support Assistant."""
-    
-    def __init__(self, developer_name: str = "Owino Brian Otieno"):
-        self.developer = developer_name
-        self.intent_engine = IntentEngine()
-        self.context = ConversationContext()
-        self.pipeline = StructuredDataPipeline()
+    conn.commit()
+    conn.close()
 
-    def process_query(self, query: str) -> Dict[str, Any]:
-        self.context.turn_count += 1
-        
-        # Latency simulated in the GUI thread instead to avoid freezing
-        match = self.intent_engine.evaluate(query)
-        self.context.current_topic = match.intent_name
-        
-        formatted_response = match.response_template
-        if match.entities.get("detected_technologies"):
-            formatted_response += f"\n[System Note: Analyzed compatibility with {match.entities['detected_technologies']}]"
 
-        turn_data = {
-            "turn": self.context.turn_count,
-            "timestamp": datetime.utcnow().strftime("%H:%M:%S"),
-            "user_query": query,
-            "bot_intent": match.intent_name,
-            "confidence": round(match.confidence, 2),
-            "bot_response": formatted_response
-        }
-        self.context.history.append(turn_data)
-        logger.info(f"Session {self.context.session_id} | Intent: {match.intent_name}")
-        return turn_data
+init_db()
 
-    def run_etl_demo(self) -> Dict[str, Any]:
-        raw_mock_leads = [
-            {"client_name": "  acme tech ", "email": "contact@acme.com", "budget_usd": "15000", "tech_stack": "Python, AWS, React"},
-            {"client_name": "stark systems", "email": "invalid-email-format", "budget_usd": None, "tech_stack": "Python, Docker"},
-            {"client_name": "cyberdyne networks!", "email": "info@cyberdyne.io ", "budget_usd": "45000.50", "tech_stack": "SQL, FastAPI, Kubernetes"}
+
+def save_message(session_id: str, role: str, content: str, intent: str = "") -> None:
+    conn = db()
+    conn.execute(
+        "INSERT INTO conversations(session_id, role, content, intent, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            session_id,
+            role,
+            content,
+            intent,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def conversation_count() -> int:
+    conn = db()
+    value = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+    conn.close()
+    return int(value)
+
+
+# =============================================================================
+# SESSION STATE
+# =============================================================================
+
+if "session_id" not in st.session_state:
+    st.session_state.session_id = uuid.uuid4().hex[:12]
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "last_sources" not in st.session_state:
+    st.session_state.last_sources = []
+
+if "last_live_results" not in st.session_state:
+    st.session_state.last_live_results = []
+
+if "last_query" not in st.session_state:
+    st.session_state.last_query = ""
+
+
+# =============================================================================
+# NETWORK HELPERS
+# =============================================================================
+
+def safe_get(url: str, params: Optional[dict] = None,
+             headers: Optional[dict] = None) -> Optional[requests.Response]:
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers or {"User-Agent": "OwinoBrianEnterpriseSuite/2.0"},
+            timeout=HTTP_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response
+    except requests.RequestException:
+        return None
+
+
+def get_json(url: str, params: Optional[dict] = None) -> Optional[dict]:
+    response = safe_get(url, params=params)
+    if response is None:
+        return None
+    try:
+        return response.json()
+    except ValueError:
+        return None
+
+
+# =============================================================================
+# LIVE DATA SOURCES
+# =============================================================================
+
+def search_github(query: str, limit: int = 8) -> List[Dict[str, Any]]:
+    data = get_json(
+        "https://api.github.com/search/repositories",
+        {"q": query, "sort": "stars", "order": "desc", "per_page": limit},
+    )
+    if not data:
+        return []
+
+    results = []
+    for item in data.get("items", []):
+        results.append({
+            "source": "GitHub",
+            "title": item.get("full_name", ""),
+            "summary": item.get("description") or "No repository description.",
+            "url": item.get("html_url", ""),
+            "metadata": (
+                f"★ {item.get('stargazers_count', 0):,} | "
+                f"Forks {item.get('forks_count', 0):,} | "
+                f"Language: {item.get('language') or 'N/A'}"
+            ),
+        })
+    return results
+
+
+def search_stackoverflow(query: str, limit: int = 8) -> List[Dict[str, Any]]:
+    data = get_json(
+        "https://api.stackexchange.com/2.3/search/advanced",
+        {
+            "site": "stackoverflow",
+            "q": query,
+            "order": "desc",
+            "sort": "relevance",
+            "pagesize": limit,
+            "filter": "default",
+        },
+    )
+    if not data:
+        return []
+
+    results = []
+    for item in data.get("items", []):
+        results.append({
+            "source": "Stack Overflow",
+            "title": re.sub(r"<[^>]+>", "", item.get("title", "")),
+            "summary": (
+                f"Score {item.get('score', 0)} | "
+                f"Answers {item.get('answer_count', 0)} | "
+                f"Tags: {', '.join(item.get('tags', []))}"
+            ),
+            "url": item.get("link", ""),
+            "metadata": "Community developer question",
+        })
+    return results
+
+
+def search_crossref(query: str, limit: int = 8) -> List[Dict[str, Any]]:
+    data = get_json(
+        "https://api.crossref.org/works",
+        {"query": query, "rows": limit, "select":
+         "title,author,published,DOI,URL,container-title,type"},
+    )
+    if not data:
+        return []
+
+    results = []
+    for item in data.get("message", {}).get("items", []):
+        title = (item.get("title") or ["Untitled"])[0]
+        journal = (item.get("container-title") or [""])[0]
+        year = ""
+        date_parts = item.get("published", {}).get("date-parts", [[]])
+        if date_parts and date_parts[0]:
+            year = str(date_parts[0][0])
+
+        results.append({
+            "source": "Crossref",
+            "title": title,
+            "summary": f"{journal} | {year} | DOI: {item.get('DOI', 'N/A')}",
+            "url": item.get("URL") or (
+                f"https://doi.org/{item.get('DOI')}" if item.get("DOI") else ""
+            ),
+            "metadata": item.get("type", "research work"),
+        })
+    return results
+
+
+def search_openalex(query: str, limit: int = 8) -> List[Dict[str, Any]]:
+    data = get_json(
+        "https://api.openalex.org/works",
+        {"search": query, "per-page": limit},
+    )
+    if not data:
+        return []
+
+    results = []
+    for item in data.get("results", []):
+        title = item.get("display_name") or "Untitled work"
+        authors = ", ".join(
+            a.get("author", {}).get("display_name", "")
+            for a in item.get("authorships", [])[:3]
+        )
+        results.append({
+            "source": "OpenAlex",
+            "title": title,
+            "summary": (
+                f"Year: {item.get('publication_year', 'N/A')} | "
+                f"Citations: {item.get('cited_by_count', 0):,} | "
+                f"Authors: {authors or 'N/A'}"
+            ),
+            "url": item.get("doi") or item.get("id", ""),
+            "metadata": "Open scholarly metadata",
+        })
+    return results
+
+
+def search_hackernews(query: str, limit: int = 8) -> List[Dict[str, Any]]:
+    data = get_json(
+        "https://hn.algolia.com/api/v1/search",
+        {"query": query, "tags": "story", "hitsPerPage": limit},
+    )
+    if not data:
+        return []
+
+    results = []
+    for item in data.get("hits", []):
+        title = item.get("title") or item.get("story_title") or "Untitled"
+        url = item.get("url") or (
+            f"https://news.ycombinator.com/item?id={item.get('objectID')}"
+        )
+        results.append({
+            "source": "Hacker News",
+            "title": title,
+            "summary": (
+                f"Points: {item.get('points', 0)} | "
+                f"Comments: {item.get('num_comments', 0)}"
+            ),
+            "url": url,
+            "metadata": "Developer/technology community",
+        })
+    return results
+
+
+def search_wikipedia(query: str) -> List[Dict[str, Any]]:
+    data = get_json(
+        "https://en.wikipedia.org/w/api.php",
+        {
+            "action": "query",
+            "list": "search",
+            "srsearch": query,
+            "format": "json",
+            "srlimit": 6,
+        },
+    )
+    if not data:
+        return []
+
+    results = []
+    for item in data.get("query", {}).get("search", []):
+        title = item.get("title", "")
+        results.append({
+            "source": "Wikipedia",
+            "title": title,
+            "summary": re.sub(r"<[^>]+>", "", item.get("snippet", "")),
+            "url": "https://en.wikipedia.org/wiki/" + title.replace(" ", "_"),
+            "metadata": "General reference",
+        })
+    return results
+
+
+def search_pypi(query: str, limit: int = 6) -> List[Dict[str, Any]]:
+    # PyPI's public JSON endpoint is excellent for exact package lookups.
+    clean = query.strip().split()[0] if query.strip() else ""
+    if not clean:
+        return []
+    data = get_json(f"https://pypi.org/pypi/{clean}/json")
+    if not data:
+        return []
+
+    info = data.get("info", {})
+    return [{
+        "source": "PyPI",
+        "title": info.get("name", clean),
+        "summary": info.get("summary") or "Python package",
+        "url": info.get("project_url") or info.get("package_url", ""),
+        "metadata": (
+            f"Version: {info.get('version', 'N/A')} | "
+            f"Python package"
+        ),
+    }]
+
+
+def live_research(query: str, sources: List[str]) -> List[Dict[str, Any]]:
+    all_results = []
+
+    for source in sources:
+        if source == "GitHub":
+            all_results.extend(search_github(query))
+        elif source == "Stack Overflow":
+            all_results.extend(search_stackoverflow(query))
+        elif source == "Crossref":
+            all_results.extend(search_crossref(query))
+        elif source == "OpenAlex":
+            all_results.extend(search_openalex(query))
+        elif source == "Hacker News":
+            all_results.extend(search_hackernews(query))
+        elif source == "Wikipedia":
+            all_results.extend(search_wikipedia(query))
+        elif source == "PyPI":
+            all_results.extend(search_pypi(query))
+
+    return all_results
+
+
+# =============================================================================
+# OPTIONAL AI ANSWER ENGINE
+# =============================================================================
+
+def get_ai_settings() -> Tuple[str, str, str]:
+    api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+    model = st.secrets.get(
+        "OPENAI_MODEL", os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    )
+    base_url = st.secrets.get(
+        "OPENAI_BASE_URL",
+        os.getenv("OPENAI_BASE_URL", "https://api.openai.com"),
+    ).rstrip("/")
+    return api_key, model, base_url
+
+
+def ask_ai(question: str, evidence: List[Dict[str, Any]]) -> Optional[str]:
+    api_key, model, base_url = get_ai_settings()
+    if not api_key:
+        return None
+
+    evidence_text = "\n".join(
+        f"- [{x['source']}] {x['title']}: {x['summary']} {x['url']}"
+        for x in evidence[:18]
+    )
+
+    system_prompt = """
+You are a broad technical and academic research assistant.
+Answer clearly and accurately. Distinguish established facts from
+recommendations or inference. For academic questions, help with
+research design, literature review, computer science, referencing,
+data analysis and dissertation writing. For development questions,
+provide practical explanations and safe production-oriented code.
+For AI questions, explain architectures, evaluation, RAG, agents,
+ML, data and deployment. Do not invent citations or claim that a
+live source says something it does not say.
+
+When live evidence is supplied, use it as evidence and include a
+short Sources section containing the supplied source names/URLs.
+"""
+
+    user_prompt = f"""
+Question:
+{question}
+
+Live research evidence:
+{evidence_text or "No live evidence was retrieved."}
+"""
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.2,
+    }
+
+    try:
+        response = requests.post(
+            f"{base_url}/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=45,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+    except (requests.RequestException, KeyError, IndexError, TypeError):
+        return None
+
+
+# =============================================================================
+# LOCAL KNOWLEDGE / FALLBACK ANSWER
+# =============================================================================
+
+def detect_topics(question: str) -> List[str]:
+    q = question.lower()
+    matches = []
+
+    for category, topics in TECH_CATEGORIES.items():
+        for topic in topics:
+            if topic.lower() in q:
+                matches.append(f"{category}: {topic}")
+
+    return list(dict.fromkeys(matches))[:12]
+
+
+def fallback_answer(question: str, evidence: List[Dict[str, Any]]) -> str:
+    topics = detect_topics(question)
+
+    if evidence:
+        lines = [
+            "I could not use an AI model key, so I am answering from the live "
+            "retrieval results rather than pretending to have generated a full "
+            "model-based answer.",
+            "",
+            f"**Question:** {question}",
+            "",
+            "**Relevant live findings:**",
         ]
-        cleaned_data, audit_metrics = self.pipeline.clean_client_dataset(raw_mock_leads)
-        return {"audit": audit_metrics, "sample_clean_record": cleaned_data}
+        for item in evidence[:8]:
+            lines.append(
+                f"- **{item['source']} — {item['title']}**: "
+                f"{item['summary']}"
+            )
+        if topics:
+            lines.extend(["", "**Detected technical areas:**"])
+            lines.extend(f"- {x}" for x in topics)
+        return "\n".join(lines)
 
-    def export_session_telemetry(self) -> str:
-        payload = {
-            "developer": self.developer,
-            "session_id": self.context.session_id,
-            "total_turns": self.context.turn_count,
-            "conversation_history": self.context.history
-        }
-        return json.dumps(payload, indent=2)
+    if topics:
+        return (
+            "I identified these areas in your question: "
+            + ", ".join(topics)
+            + ". Enable an AI provider key in Streamlit Secrets for "
+              "full natural-language answers, or use the Live Research "
+              "tab to retrieve current evidence."
+        )
 
-# ==============================================================================
-# PROFESSIONAL GRAPHICAL USER INTERFACE (GUI)
-# ==============================================================================
-class EnterpriseAppGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Owino Brian Enterprise Suite - AI & Pipeline Simulator")
-        self.root.geometry("1000x700")
-        self.root.configure(bg="#1e1e1e")
-        
-        self.assistant = TechnicalSupportChatbot()
-        
-        self.setup_styles()
-        self.build_ui()
-        self.greet_user()
+    return (
+        "I can route this question to the live research connectors, but a "
+        "general-purpose AI answer requires an AI provider API key. Add "
+        "OPENAI_API_KEY in Streamlit Secrets, then retry the question."
+    )
 
-    def setup_styles(self):
-        style = ttk.Style()
-        style.theme_use('clam')
-        
-        # Configure Colors & Fonts
-        style.configure("TNotebook", background="#2d2d2d", borderwidth=0)
-        style.configure("TNotebook.Tab", background="#3d3d3d", foreground="white", padding=[15, 5], font=('Segoe UI', 10, 'bold'))
-        style.map("TNotebook.Tab", background=[("selected", "#0078D7")])
-        
-        style.configure("TFrame", background="#1e1e1e")
-        style.configure("TLabel", background="#1e1e1e", foreground="#ffffff", font=('Segoe UI', 11))
-        style.configure("TButton", font=('Segoe UI', 10, 'bold'), background="#0078D7", foreground="white", padding=6)
-        style.map("TButton", background=[("active", "#005a9e")])
-        style.configure("Title.TLabel", font=('Segoe UI', 16, 'bold'), foreground="#00a8ff")
 
-    def build_ui(self):
-        # Header
-        header_frame = ttk.Frame(self.root)
-        header_frame.pack(side=tk.TOP, fill=tk.X, pady=10, padx=20)
-        
-        ttk.Label(header_frame, text="ENTERPRISE TECHNICAL SUITE", style="Title.TLabel").pack(anchor=tk.W)
-        ttk.Label(header_frame, text="Architected by: Owino Brian Otieno | Live AI Simulator", foreground="#888888").pack(anchor=tk.W)
+# =============================================================================
+# ETL ENGINE
+# =============================================================================
 
-        # Main Notebook (Tabs)
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(expand=True, fill=tk.BOTH, padx=20, pady=10)
+def clean_dataframe(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    original_rows = len(df)
+    working = df.copy()
 
-        self.tab_chat = ttk.Frame(self.notebook)
-        self.tab_etl = ttk.Frame(self.notebook)
-        self.tab_telemetry = ttk.Frame(self.notebook)
+    working.columns = [
+        re.sub(r"\s+", "_", str(c).strip().lower())
+        for c in working.columns
+    ]
 
-        self.notebook.add(self.tab_chat, text=" 🤖 AI Assistant ")
-        self.notebook.add(self.tab_etl, text=" ⚙️ Data Pipeline (ETL) ")
-        self.notebook.add(self.tab_telemetry, text=" 📊 Session Telemetry ")
+    missing_before = int(working.isna().sum().sum())
 
-        self._build_chat_tab()
-        self._build_etl_tab()
-        self._build_telemetry_tab()
+    for column in working.columns:
+        if pd.api.types.is_object_dtype(working[column]):
+            working[column] = working[column].astype(str).str.strip()
 
-    def _build_chat_tab(self):
-        # Chat History Log
-        self.chat_log = scrolledtext.ScrolledText(self.tab_chat, wrap=tk.WORD, state=tk.DISABLED, 
-                                                  bg="#252526", fg="#cccccc", font=('Consolas', 11),
-                                                  bd=0, padx=10, pady=10)
-        self.chat_log.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
-        
-        # Tag configurations for colored text
-        self.chat_log.tag_config("user", foreground="#4fc1ff", font=('Consolas', 11, 'bold'))
-        self.chat_log.tag_config("bot", foreground="#4ec9b0")
-        self.chat_log.tag_config("meta", foreground="#808080", font=('Consolas', 9, 'italic'))
+    # Standard email cleaning if an email field exists.
+    email_columns = [c for c in working.columns if "email" in c]
+    invalid_emails = 0
+    if email_columns:
+        col = email_columns[0]
+        pattern = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+        invalid_mask = ~working[col].fillna("").astype(str).str.match(pattern)
+        invalid_emails = int(invalid_mask.sum())
 
-        # Input Area
-        input_frame = ttk.Frame(self.tab_chat)
-        input_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+    working = working.drop_duplicates().reset_index(drop=True)
+    missing_after = int(working.isna().sum().sum())
 
-        self.user_input_var = tk.StringVar()
-        self.entry_box = tk.Entry(input_frame, textvariable=self.user_input_var, font=('Segoe UI', 12),
-                                  bg="#3c3c3c", fg="white", insertbackground="white", relief=tk.FLAT)
-        self.entry_box.pack(side=tk.LEFT, expand=True, fill=tk.X, ipady=8)
-        self.entry_box.bind("<Return>", lambda event: self.handle_send())
+    metrics = {
+        "input_rows": original_rows,
+        "output_rows": len(working),
+        "duplicates_removed": original_rows - len(working),
+        "missing_values_before": missing_before,
+        "missing_values_after": missing_after,
+        "invalid_emails_detected": invalid_emails,
+        "columns": len(working.columns),
+    }
 
-        send_btn = ttk.Button(input_frame, text="SEND QUERY", command=self.handle_send)
-        send_btn.pack(side=tk.RIGHT, padx=(10, 0))
+    return working, metrics
 
-    def _build_etl_tab(self):
-        top_frame = ttk.Frame(self.tab_etl)
-        top_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        ttk.Label(top_frame, text="Simulate Data Ingestion & Transformation", font=('Segoe UI', 12, 'bold')).pack(side=tk.LEFT)
-        ttk.Button(top_frame, text="Execute ETL Pipeline", command=self.run_etl_pipeline).pack(side=tk.RIGHT)
 
-        self.etl_log = scrolledtext.ScrolledText(self.tab_etl, wrap=tk.WORD, state=tk.DISABLED, 
-                                                 bg="#1e1e1e", fg="#dcdcaa", font=('Consolas', 10), bd=0)
-        self.etl_log.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
+# =============================================================================
+# UI STYLING
+# =============================================================================
 
-    def _build_telemetry_tab(self):
-        top_frame = ttk.Frame(self.tab_telemetry)
-        top_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        ttk.Label(top_frame, text="Live Architectural Session State", font=('Segoe UI', 12, 'bold')).pack(side=tk.LEFT)
-        ttk.Button(top_frame, text="Refresh Logs", command=self.refresh_telemetry).pack(side=tk.RIGHT)
+st.markdown("""
+<style>
+    .main {
+        background: #0b1020;
+    }
+    .block-container {
+        max-width: 1500px;
+        padding-top: 1.2rem;
+    }
+    .hero {
+        padding: 1.4rem 1.6rem;
+        border-radius: 18px;
+        background: linear-gradient(135deg, #111a33, #18284a);
+        border: 1px solid #2b416b;
+        margin-bottom: 1rem;
+    }
+    .hero h1 {
+        margin: 0;
+        font-size: 2.2rem;
+    }
+    .hero p {
+        color: #b8c7e0;
+        margin-top: .45rem;
+    }
+    .card {
+        padding: 1rem;
+        border-radius: 14px;
+        border: 1px solid #293958;
+        background: #111827;
+        min-height: 120px;
+    }
+    .small {
+        color: #9fb0ca;
+        font-size: .86rem;
+    }
+    .source {
+        padding: .7rem;
+        border-radius: 10px;
+        background: #101827;
+        border: 1px solid #25334d;
+        margin-bottom: .5rem;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-        self.telemetry_log = scrolledtext.ScrolledText(self.tab_telemetry, wrap=tk.WORD, state=tk.DISABLED, 
-                                                       bg="#1e1e1e", fg="#ce9178", font=('Consolas', 10), bd=0)
-        self.telemetry_log.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
 
-    # --- Actions & Logic ---
-    def write_chat(self, sender: str, message: str, tag: str, meta: str = ""):
-        self.chat_log.config(state=tk.NORMAL)
-        if meta:
-            self.chat_log.insert(tk.END, f"{meta}\n", "meta")
-        self.chat_log.insert(tk.END, f"{sender} ", tag)
-        self.chat_log.insert(tk.END, f"{message}\n\n")
-        self.chat_log.config(state=tk.DISABLED)
-        self.chat_log.yview(tk.END)
+# =============================================================================
+# SIDEBAR
+# =============================================================================
 
-    def greet_user(self):
-        self.write_chat("OwinoBrian_AI_Agent >", 
-                        "System Initialized. I am the intelligence engine architected by Owino Brian. How can I assist you with your tech stack today?", 
-                        "bot")
+with st.sidebar:
+    st.title("🧠 Control Centre")
+    st.caption("Enterprise AI, research, development and data workspace")
 
-    def handle_send(self):
-        query = self.user_input_var.get().strip()
-        if not query: return
-        
-        self.user_input_var.set("")
-        self.write_chat("You >", query, "user")
-        
-        # Show 'Typing...' indicator
-        self.chat_log.config(state=tk.NORMAL)
-        typing_idx = self.chat_log.index(tk.INSERT)
-        self.chat_log.insert(tk.END, "Agent is analyzing...", "meta")
-        self.chat_log.config(state=tk.DISABLED)
-        
-        # Process in thread to avoid GUI freeze
-        threading.Thread(target=self._process_and_respond, args=(query, typing_idx)).start()
+    research_sources = st.multiselect(
+        "Live research sources",
+        [
+            "GitHub",
+            "Stack Overflow",
+            "Crossref",
+            "OpenAlex",
+            "Hacker News",
+            "Wikipedia",
+            "PyPI",
+        ],
+        default=["GitHub", "Stack Overflow", "Crossref", "OpenAlex"],
+    )
 
-    def _process_and_respond(self, query: str, typing_idx: str):
-        # Simulate processing latency naturally
-        time.sleep(random.uniform(0.6, 1.2))
-        res = self.assistant.process_query(query)
-        
-        # Update GUI from thread
-        self.root.after(0, self._render_response, res, typing_idx)
+    st.divider()
 
-    def _render_response(self, res: dict, typing_idx: str):
-        self.chat_log.config(state=tk.NORMAL)
-        # Delete typing indicator
-        self.chat_log.delete(typing_idx, tk.END)
-        self.chat_log.config(state=tk.DISABLED)
-        
-        meta_info = f"[Intent: {res['bot_intent'].upper()} | Confidence: {res['confidence']*100:.0f}% | Latency: 42ms]"
-        self.write_chat("OwinoBrian_AI_Agent >", res['bot_response'], "bot", meta=meta_info)
+    api_key, ai_model, _ = get_ai_settings()
+    if api_key:
+        st.success(f"AI engine enabled · {ai_model}")
+    else:
+        st.warning(
+            "AI engine is not configured. Live research and the local "
+            "knowledge catalogue still work."
+        )
 
-    def run_etl_pipeline(self):
-        self.etl_log.config(state=tk.NORMAL)
-        self.etl_log.delete(1.0, tk.END)
-        self.etl_log.insert(tk.END, "[SYSTEM] Initiating Data Extraction, Transformation, and Load (ETL)...\n\n")
-        self.root.update_idletasks()
-        
-        time.sleep(1) # Simulate crunching data
-        
-        result = self.assistant.run_etl_demo()
-        output = "================ PIPELINE METRICS ================\n"
-        output += json.dumps(result["audit"], indent=4)
-        output += "\n\n================ CLEANED RECORDS (SAMPLE) ========\n"
-        output += json.dumps(result["sample_clean_record"], indent=4)
-        
-        self.etl_log.insert(tk.END, output)
-        self.etl_log.config(state=tk.DISABLED)
-        self.notebook.select(self.tab_etl)
+    st.metric("Conversation records", conversation_count())
+    st.caption(f"Session: `{st.session_state.session_id}`")
 
-    def refresh_telemetry(self):
-        self.telemetry_log.config(state=tk.NORMAL)
-        self.telemetry_log.delete(1.0, tk.END)
-        logs = self.assistant.export_session_telemetry()
-        self.telemetry_log.insert(tk.END, logs)
-        self.telemetry_log.config(state=tk.DISABLED)
+    if st.button("🧹 Start New Chat", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.last_sources = []
+        st.rerun()
 
-# ==============================================================================
-# MAIN EXECUTION
-# ==============================================================================
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = EnterpriseAppGUI(root)
-    root.mainloop()
+    st.divider()
+    st.caption("Supported areas")
+    for category in TECH_CATEGORIES:
+        st.write(f"• {category}")
+
+
+# =============================================================================
+# HEADER / DASHBOARD
+# =============================================================================
+
+st.markdown("""
+<div class="hero">
+    <h1>🧠 Enterprise Technical Intelligence Suite</h1>
+    <p>
+        Live research • AI assistant • academic research • software engineering
+        • data engineering • DevOps • cloud • cybersecurity • ETL
+    </p>
+</div>
+""", unsafe_allow_html=True)
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Knowledge domains", len(TECH_CATEGORIES))
+m2.metric("Live connectors", 7)
+m3.metric("Database", "SQLite")
+m4.metric("Session turns", len(st.session_state.messages))
+
+
+# =============================================================================
+# MAIN TABS
+# =============================================================================
+
+chat_tab, research_tab, etl_tab, database_tab, system_tab = st.tabs([
+    "💬 AI Assistant",
+    "🌐 Live Research",
+    "🧹 Data / ETL",
+    "🗄️ Knowledge Database",
+    "⚙️ System"
+])
+
+
+# =============================================================================
+# CHAT TAB
+# =============================================================================
+
+with chat_tab:
+    left, right = st.columns([2.2, 1])
+
+    with right:
+        st.subheader("Answer controls")
+        auto_research = st.toggle(
+            "Use live research automatically",
+            value=True,
+            help="Retrieve current evidence before generating an answer.",
+        )
+        max_sources = st.slider("Evidence records", 3, 20, 8)
+
+        st.info(
+            "For genuinely broad questions, configure OPENAI_API_KEY in "
+            "Streamlit Secrets. Without it, the app will not pretend that "
+            "a rule-based matcher is a general AI model."
+        )
+
+    with left:
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+        question = st.chat_input(
+            "Ask about AI, programming, databases, cloud, cybersecurity, "
+            "research, algorithms, DevOps, academic writing, etc."
+        )
+
+        if question:
+            st.session_state.last_query = question
+            st.session_state.messages.append({
+                "role": "user",
+                "content": question,
+            })
+            save_message(st.session_state.session_id, "user", question)
+
+            with st.chat_message("user"):
+                st.markdown(question)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Analysing question and retrieving current evidence..."):
+                    evidence = []
+                    if auto_research and research_sources:
+                        evidence = live_research(question, research_sources)
+                        evidence = evidence[:max_sources]
+
+                    answer = ask_ai(question, evidence)
+                    if not answer:
+                        answer = fallback_answer(question, evidence)
+
+                    st.markdown(answer)
+
+                    if evidence:
+                        st.markdown("#### Live evidence used")
+                        for item in evidence[:max_sources]:
+                            st.markdown(
+                                f"- **{item['source']} — {item['title']}**  \n"
+                                f"  {item['summary']}  \n"
+                                f"  {item['url']}"
+                            )
+
+            st.session_state.last_sources = evidence
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": answer,
+            })
+            save_message(st.session_state.session_id, "assistant", answer)
+
+
+# =============================================================================
+# LIVE RESEARCH TAB
+# =============================================================================
+
+with research_tab:
+    st.subheader("🌐 Live Technology & Academic Research")
+
+    rq1, rq2 = st.columns([4, 1])
+    with rq1:
+        query = st.text_input(
+            "Research query",
+            value=st.session_state.last_query,
+            placeholder="e.g. RAG evaluation, Python FastAPI, transformer architecture",
+        )
+    with rq2:
+        run_search = st.button("🔎 Search Live", type="primary", use_container_width=True)
+
+    if run_search and query.strip():
+        with st.spinner("Querying live public sources..."):
+            results = live_research(query.strip(), research_sources)
+        st.session_state.last_live_results = results
+
+    results = st.session_state.last_live_results
+
+    if results:
+        st.success(f"Retrieved {len(results)} live records.")
+        for item in results:
+            st.markdown(
+                f"""
+                <div class="source">
+                    <strong>{item['source']}</strong><br>
+                    <a href="{item['url']}" target="_blank">{item['title']}</a><br>
+                    <span class="small">{item['summary']}</span><br>
+                    <span class="small">{item['metadata']}</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    else:
+        st.info("Run a live search to populate current research results.")
+
+
+# =============================================================================
+# ETL TAB
+# =============================================================================
+
+with etl_tab:
+    st.subheader("🧹 Data Engineering & ETL Workspace")
+    st.write(
+        "Upload CSV, Excel or JSON data. The pipeline normalises column names, "
+        "trims text, removes duplicates and reports quality metrics."
+    )
+
+    uploaded = st.file_uploader(
+        "Upload a dataset",
+        type=["csv", "xlsx", "xls", "json"],
+    )
+
+    if uploaded:
+        try:
+            if uploaded.name.lower().endswith(".csv"):
+                source_df = pd.read_csv(uploaded)
+            elif uploaded.name.lower().endswith((".xlsx", ".xls")):
+                source_df = pd.read_excel(uploaded)
+            else:
+                source_df = pd.read_json(uploaded)
+
+            st.write("### Source preview")
+            st.dataframe(source_df.head(100), use_container_width=True)
+
+            cleaned_df, metrics = clean_dataframe(source_df)
+
+            st.write("### Pipeline metrics")
+            cols = st.columns(len(metrics))
+            for col, (key, value) in zip(cols, metrics.items()):
+                col.metric(key.replace("_", " ").title(), value)
+
+            st.write("### Cleaned data")
+            st.dataframe(cleaned_df.head(100), use_container_width=True)
+
+            csv_bytes = cleaned_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download cleaned CSV",
+                data=csv_bytes,
+                file_name="cleaned_dataset.csv",
+                mime="text/csv",
+            )
+
+        except Exception as exc:
+            st.error(f"Could not process this file: {exc}")
+
+
+# =============================================================================
+# KNOWLEDGE DATABASE TAB
+# =============================================================================
+
+with database_tab:
+    st.subheader("🗄️ Local Knowledge Catalogue")
+
+    conn = db()
+    df_kb = pd.read_sql_query(
+        "SELECT id, category, topic, description FROM knowledge_base "
+        "ORDER BY category, topic",
+        conn,
+    )
+    conn.close()
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        kb_search = st.text_input("Search the local catalogue")
+    with c2:
+        kb_category = st.selectbox(
+            "Category",
+            ["All"] + sorted(df_kb["category"].unique().tolist()),
+        )
+
+    filtered = df_kb.copy()
+    if kb_search.strip():
+        mask = (
+            filtered["topic"].str.contains(kb_search, case=False, na=False)
+            | filtered["description"].str.contains(
+                kb_search, case=False, na=False
+            )
+        )
+        filtered = filtered[mask]
+
+    if kb_category != "All":
+        filtered = filtered[filtered["category"] == kb_category]
+
+    st.metric("Matching catalogue records", len(filtered))
+    st.dataframe(filtered, use_container_width=True, hide_index=True)
+
+
+# =============================================================================
+# SYSTEM TAB
+# =============================================================================
+
+with system_tab:
+    st.subheader("⚙️ System Diagnostics")
+
+    api_key, model, base_url = get_ai_settings()
+
+    d1, d2, d3 = st.columns(3)
+    d1.metric("AI provider", "Configured" if api_key else "Not configured")
+    d2.metric("AI model", model)
+    d3.metric("Live sources", len(research_sources))
+
+    st.write("### Architecture")
+    st.markdown("""
+    **Browser UI → Streamlit → Research connectors → Optional AI engine → SQLite**
+
+    The application intentionally avoids desktop GUI dependencies such as
+    Tkinter. This is important for cloud deployment because Streamlit apps run
+    in a Linux server environment rather than a normal Windows desktop session.
+
+    **Live connectors**
+    - GitHub repository search
+    - Stack Overflow developer search
+    - Crossref scholarly metadata
+    - OpenAlex scholarly metadata
+    - Hacker News technology stories
+    - Wikipedia reference search
+    - PyPI package metadata
+
+    **Persistent application data**
+    - Conversation history
+    - Research cache schema
+    - User feedback schema
+    - Local technical knowledge catalogue
+    """)
+
+    st.write("### Export session")
+    export_payload = {
+        "session_id": st.session_state.session_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "messages": st.session_state.messages,
+        "last_sources": st.session_state.last_sources,
+    }
+
+    st.download_button(
+        "⬇️ Export session JSON",
+        data=json.dumps(export_payload, indent=2),
+        file_name=f"session_{st.session_state.session_id}.json",
+        mime="application/json",
+    )
+
+    st.write("### Feedback")
+    rating = st.slider("Rate this session", 1, 5, 5)
+    comment = st.text_area("Optional comment")
+    if st.button("Save feedback"):
+        conn = db()
+        conn.execute(
+            "INSERT INTO feedback(session_id, rating, comment, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                st.session_state.session_id,
+                rating,
+                comment,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+        conn.close()
+        st.success("Feedback saved.")
+
+
+# =============================================================================
+# FOOTER
+# =============================================================================
+
+st.divider()
+st.caption(
+    "Owino Brian Enterprise Technical Suite • Web-safe architecture • "
+    "Live public-data retrieval • Optional AI reasoning • SQLite persistence"
+)

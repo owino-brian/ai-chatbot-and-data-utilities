@@ -206,10 +206,20 @@ def initialise_database() -> None:
             conversation_id TEXT NOT NULL,
             question TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            emailed INTEGER NOT NULL DEFAULT 0
+            emailed INTEGER NOT NULL DEFAULT 0,
+            error TEXT
         )
         """
     )
+    # Databases created before the "error" column existed: add it so a
+    # failed delivery leaves a diagnosable reason (missing credentials,
+    # authentication failure, network error) instead of failing silently
+    # with no trace of why.
+    existing_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(escalations)").fetchall()
+    }
+    if "error" not in existing_columns:
+        conn.execute("ALTER TABLE escalations ADD COLUMN error TEXT")
     # A previous version of this app created a conversation row the moment
     # "New chat" was clicked, before any message existed, which is why the
     # sidebar could fill up with empty "New conversation" entries. This
@@ -300,7 +310,19 @@ def log_escalation(conversation_id: str, question: str) -> int:
 
 def mark_escalation_emailed(escalation_id: int) -> None:
     conn = get_connection()
-    conn.execute("UPDATE escalations SET emailed = 1 WHERE id = ?", (escalation_id,))
+    conn.execute("UPDATE escalations SET emailed = 1, error = NULL WHERE id = ?", (escalation_id,))
+    conn.commit()
+    conn.close()
+
+
+def record_escalation_error(escalation_id: int, error_text: str) -> None:
+    """Records why an escalation email did not send, so the developer can
+    open the local database and see the real reason (no credentials
+    configured, authentication failure, network error, etc.) instead of
+    the delivery just failing with no trace. This is never shown to the
+    visitor."""
+    conn = get_connection()
+    conn.execute("UPDATE escalations SET error = ? WHERE id = ?", (error_text, escalation_id))
     conn.commit()
     conn.close()
 
@@ -321,12 +343,25 @@ def send_to_human_agents(question: str, conversation_id: str) -> bool:
     added to the body below."""
     escalation_id = log_escalation(conversation_id, question)
 
-    smtp_host = st.secrets.get("SMTP_HOST", os.getenv("SMTP_HOST", ""))
+    smtp_host = st.secrets.get("SMTP_HOST", os.getenv("SMTP_HOST", "")).strip()
     smtp_port = st.secrets.get("SMTP_PORT", os.getenv("SMTP_PORT", "587"))
-    smtp_username = st.secrets.get("SMTP_USERNAME", os.getenv("SMTP_USERNAME", ""))
+    smtp_username = st.secrets.get("SMTP_USERNAME", os.getenv("SMTP_USERNAME", "")).strip()
     smtp_password = st.secrets.get("SMTP_PASSWORD", os.getenv("SMTP_PASSWORD", ""))
 
+    # If the deployer configured a Gmail sending account but did not set an
+    # explicit host, default to Gmail's SMTP server so the common case
+    # (sending through a Gmail account) works without extra configuration.
+    # An explicit SMTP_HOST always takes priority over this default.
+    if not smtp_host and smtp_username.lower().endswith("@gmail.com"):
+        smtp_host = "smtp.gmail.com"
+
     if not (smtp_host and smtp_username and smtp_password):
+        record_escalation_error(
+            escalation_id,
+            "SMTP is not configured: set SMTP_USERNAME and SMTP_PASSWORD (and SMTP_HOST if not "
+            "sending through Gmail) as Streamlit secrets or environment variables. Gmail requires "
+            "a 16-character App Password, not the account's normal login password.",
+        )
         return False
 
     body = (
@@ -350,7 +385,8 @@ def send_to_human_agents(question: str, conversation_id: str) -> bool:
             server.send_message(message)
         mark_escalation_emailed(escalation_id)
         return True
-    except Exception:
+    except Exception as exc:
+        record_escalation_error(escalation_id, f"{type(exc).__name__}: {exc}")
         return False
 
 
@@ -389,8 +425,11 @@ if "uploaded_name" not in st.session_state:
     st.session_state.uploaded_name = None
 
 if "pending_escalation" not in st.session_state:
-    # None, or the exact question text awaiting a yes/no reply from the
-    # visitor about forwarding it to OBO Human Agents.
+    # None, or a dict {"question": str, "with_evidence": bool} describing a
+    # question awaiting a yes/no reply from the visitor about forwarding it
+    # to OBO Human Agents. with_evidence is True when live-search sources
+    # were already shown alongside the question, which changes what a "no"
+    # reply means (sources were enough) versus a plain decline.
     st.session_state.pending_escalation = None
 
 if "last_evidence" not in st.session_state:
@@ -1215,12 +1254,36 @@ def classify_yes_no(text: str) -> str | None:
 
 
 def escalation_prompt_message() -> str:
+    """Used when live search is off, or on but found nothing: no sources
+    exist to offer, so this asks permission to forward straight away."""
     return (
         "I am sorry, but this question falls outside my current knowledge base, and I would "
         "rather say so plainly than guess or risk giving you inaccurate information.\n\n"
         f"Would you like me to forward this question to **{HUMAN_AGENTS_LABEL}**? Please reply "
         "yes or no."
     )
+
+
+def escalation_prompt_with_evidence_message(evidence: list[dict[str, str]]) -> str:
+    """Used when live search is on and did find sources: the question is
+    still outside the verified knowledge base, so those sources are shown
+    as evidence to check, not stated as fact, and the visitor is still
+    asked whether they also want it forwarded to a human agent."""
+    lines = [
+        "This is outside my verified knowledge base, so I am not going to state it as fact. "
+        "Live search did find some potentially relevant sources, which you should check "
+        "yourself:",
+        "",
+    ]
+    for item in evidence:
+        lines.append(f"- **{item['source']}** — [{item['title']}]({item['url']})")
+    lines.append("")
+    lines.append(
+        f"Would you like me to also forward this question to **{HUMAN_AGENTS_LABEL}** for a "
+        "confirmed answer? Reply yes to have it forwarded, or no if the sources above are "
+        "enough."
+    )
+    return "\n".join(lines)
 
 
 def escalation_confirmed_message() -> str:
@@ -1231,6 +1294,8 @@ def escalation_confirmed_message() -> str:
 
 
 def escalation_declined_message() -> str:
+    """Used when there were no sources on offer: the decline explains the
+    knowledge-base limits and points to what the bot can help with."""
     topics_overview = "\n".join(f"- {category}" for category in KNOWLEDGE_CATEGORIES)
     return (
         "Okay. I am sorry, I cannot respond to a question outside my knowledge base, since I "
@@ -1241,7 +1306,22 @@ def escalation_declined_message() -> str:
     )
 
 
-def escalation_reply_unclear_message() -> str:
+def escalation_declined_with_evidence_message() -> str:
+    """Used when the visitor was shown live-search sources and confirmed
+    those are enough, rather than wanting a human agent as well."""
+    return (
+        "Understood, glad the sources above were useful. Let me know if you have any other "
+        "question."
+    )
+
+
+def escalation_reply_unclear_message(with_evidence: bool) -> str:
+    if with_evidence:
+        return (
+            "Sorry, I did not catch a clear yes or no there. Would you like me to also forward "
+            f"your question to **{HUMAN_AGENTS_LABEL}**, or are the sources shown above enough? "
+            "Please reply yes or no."
+        )
     return (
         "Sorry, I did not catch a clear yes or no there. Would you like me to forward your "
         f"question to **{HUMAN_AGENTS_LABEL}**? Please reply yes or no."
@@ -1535,12 +1615,21 @@ def _format_live_results(evidence: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def generate_answer(question: str, live_search_enabled: bool) -> tuple[str, list[dict[str, str]], bool]:
-    """Returns (answer_text, evidence, needs_escalation). needs_escalation is
-    True only when the question is genuinely outside the knowledge base
-    (and live search, if enabled, found nothing useful either); the caller
-    is then responsible for asking the visitor's permission before any
-    question is forwarded to a human agent."""
+# needs_escalation values returned by generate_answer:
+#   False            -> answered directly, nothing to escalate
+#   "plain"          -> outside the knowledge base, no sources to offer
+#                       (live search was off, or on but found nothing)
+#   "with_evidence"  -> outside the knowledge base, but live search found
+#                       sources that are shown alongside the same yes/no
+#                       escalation question
+
+def generate_answer(
+    question: str, live_search_enabled: bool
+) -> tuple[str, list[dict[str, str]], bool | str]:
+    """Returns (answer_text, evidence, needs_escalation). The caller is
+    responsible for asking the visitor's permission before any question is
+    forwarded to a human agent — this function never sends anything by
+    itself."""
     conversational = find_conversation_response(question)
     if conversational:
         return conversational, [], False
@@ -1548,7 +1637,9 @@ def generate_answer(question: str, live_search_enabled: bool) -> tuple[str, list
     # An explicit request to go look something up externally takes priority
     # over a loose knowledge-base keyword match, so a question like "find
     # current GitHub projects for Python data engineering" is not silently
-    # answered with the static definition of Python instead.
+    # answered with the static definition of Python instead. This is an
+    # explicit search action rather than an out-of-scope knowledge-base
+    # question, so it is answered directly without the escalation prompt.
     if is_live_search_intent(question):
         if not live_search_enabled:
             return (
@@ -1575,17 +1666,15 @@ def generate_answer(question: str, live_search_enabled: bool) -> tuple[str, list
     if browse:
         return browse, [], False
 
+    # Genuinely outside the knowledge base. If live search is on and finds
+    # something, show the sources as evidence (never stated as fact) and
+    # still ask permission to forward to a human agent as well. If live
+    # search is off, or on but empty, ask permission with no sources shown.
     evidence = run_live_search(question) if live_search_enabled else []
     if evidence:
-        return (
-            "This is outside my verified knowledge base, so I am not going to state it as fact. "
-            "Live search did find some potentially relevant sources, which you should check "
-            "yourself:\n\n" + _format_live_results(evidence),
-            evidence,
-            False,
-        )
+        return escalation_prompt_with_evidence_message(evidence), evidence, "with_evidence"
 
-    return escalation_prompt_message(), [], True
+    return escalation_prompt_message(), [], "plain"
 
 
 # =============================================================================
@@ -1803,24 +1892,33 @@ if question or attachment_summary or attachment_error:
             if st.session_state.pending_escalation:
                 # This message is a reply to "would you like me to forward
                 # this to a human agent?", not a fresh question.
-                pending_question = st.session_state.pending_escalation
+                pending = st.session_state.pending_escalation
+                pending_question = pending["question"]
+                had_evidence = pending["with_evidence"]
                 decision = classify_yes_no(question)
                 if decision == "yes":
                     send_to_human_agents(pending_question, st.session_state.conversation_id)
                     parts.append(escalation_confirmed_message())
                     st.session_state.pending_escalation = None
                 elif decision == "no":
-                    parts.append(escalation_declined_message())
+                    parts.append(
+                        escalation_declined_with_evidence_message()
+                        if had_evidence
+                        else escalation_declined_message()
+                    )
                     st.session_state.pending_escalation = None
                 else:
-                    parts.append(escalation_reply_unclear_message())
+                    parts.append(escalation_reply_unclear_message(had_evidence))
             else:
                 with st.spinner("Checking the knowledge base..."):
                     text_answer, evidence, needs_escalation = generate_answer(
                         question, st.session_state.live_search_enabled
                     )
                 if needs_escalation:
-                    st.session_state.pending_escalation = question
+                    st.session_state.pending_escalation = {
+                        "question": question,
+                        "with_evidence": needs_escalation == "with_evidence",
+                    }
                 parts.append(text_answer)
 
         answer = "\n\n".join(parts)

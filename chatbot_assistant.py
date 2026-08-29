@@ -4,7 +4,6 @@ Streamlit edition - web/cloud safe
 Developer: Owino Brian Otieno
 
 Key design goals:
-- No tkinter/Tk dependencies.
 - Streamlit-native graphical interface.
 - SQLite persistence for local application data.
 - Live public data retrieval from several research/developer APIs.
@@ -34,7 +33,7 @@ import streamlit as st
 # =============================================================================
 
 st.set_page_config(
-    page_title="Owino Brian | Enterprise Technical Suite",
+    page_title="Xerxes Brian Technical Suite",
     page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -258,7 +257,7 @@ def search_github(query: str, limit: int = 8) -> List[Dict[str, Any]]:
             "summary": item.get("description") or "No repository description.",
             "url": item.get("html_url", ""),
             "metadata": (
-                f"★ {item.get('stargazers_count', 0):,} | "
+                f"{item.get('stargazers_count', 0):,} | "
                 f"Forks {item.get('forks_count', 0):,} | "
                 f"Language: {item.get('language') or 'N/A'}"
             ),
@@ -683,7 +682,7 @@ st.markdown("""
 # =============================================================================
 
 with st.sidebar:
-    st.title("🧠 Control Centre")
+    st.title("Control Centre")
     st.caption("Enterprise AI, research, development and data workspace")
 
     research_sources = st.multiselect(
@@ -714,7 +713,7 @@ with st.sidebar:
     st.metric("Conversation records", conversation_count())
     st.caption(f"Session: `{st.session_state.session_id}`")
 
-    if st.button("🧹 Start New Chat", use_container_width=True):
+    if st.button("Start New Chat", use_container_width=True):
         st.session_state.messages = []
         st.session_state.last_sources = []
         st.rerun()
@@ -731,7 +730,7 @@ with st.sidebar:
 
 st.markdown("""
 <div class="hero">
-    <h1>🧠 Enterprise Technical Intelligence Suite</h1>
+    <h1>Enterprise Technical Intelligence Suite</h1>
     <p>
         Live research • AI assistant • academic research • software engineering
         • data engineering • DevOps • cloud • cybersecurity • ETL
@@ -751,11 +750,11 @@ m4.metric("Session turns", len(st.session_state.messages))
 # =============================================================================
 
 chat_tab, research_tab, etl_tab, database_tab, system_tab = st.tabs([
-    "💬 AI Assistant",
-    "🌐 Live Research",
-    "🧹 Data / ETL",
-    "🗄️ Knowledge Database",
-    "⚙️ System"
+    "AI Assistant",
+    "Live Research",
+    "Data / ETL",
+    "Knowledge Database",
+    "System"
 ])
 
 
@@ -837,7 +836,7 @@ with chat_tab:
 # =============================================================================
 
 with research_tab:
-    st.subheader("🌐 Live Technology & Academic Research")
+    st.subheader("Live Technology & Academic Research")
 
     rq1, rq2 = st.columns([4, 1])
     with rq1:
@@ -847,7 +846,7 @@ with research_tab:
             placeholder="e.g. RAG evaluation, Python FastAPI, transformer architecture",
         )
     with rq2:
-        run_search = st.button("🔎 Search Live", type="primary", use_container_width=True)
+        run_search = st.button("Search Live", type="primary", use_container_width=True)
 
     if run_search and query.strip():
         with st.spinner("Querying live public sources..."):
@@ -879,7 +878,7 @@ with research_tab:
 # =============================================================================
 
 with etl_tab:
-    st.subheader("🧹 Data Engineering & ETL Workspace")
+    st.subheader("Data Engineering & ETL Workspace")
     st.write(
         "Upload CSV, Excel or JSON data. The pipeline normalises column names, "
         "trims text, removes duplicates and reports quality metrics."
@@ -914,7 +913,7 @@ with etl_tab:
 
             csv_bytes = cleaned_df.to_csv(index=False).encode("utf-8")
             st.download_button(
-                "⬇️ Download cleaned CSV",
+                "Download cleaned CSV",
                 data=csv_bytes,
                 file_name="cleaned_dataset.csv",
                 mime="text/csv",
@@ -929,7 +928,7 @@ with etl_tab:
 # =============================================================================
 
 with database_tab:
-    st.subheader("🗄️ Local Knowledge Catalogue")
+    st.subheader("Local Knowledge Catalogue")
 
     conn = db()
     df_kb = pd.read_sql_query(
@@ -970,7 +969,7 @@ with database_tab:
 # =============================================================================
 
 with system_tab:
-    st.subheader("⚙️ System Diagnostics")
+    st.subheader("System Diagnostics")
 
     api_key, model, base_url = get_ai_settings()
 
@@ -1012,7 +1011,7 @@ with system_tab:
     }
 
     st.download_button(
-        "⬇️ Export session JSON",
+        "Export session JSON",
         data=json.dumps(export_payload, indent=2),
         file_name=f"session_{st.session_state.session_id}.json",
         mime="application/json",
@@ -1044,6 +1043,6 @@ with system_tab:
 
 st.divider()
 st.caption(
-    "Owino Brian Enterprise Technical Suite • Web-safe architecture • "
+    "Xerxes Brian Technical Suite • Web-safe architecture • "
     "Live public-data retrieval • Optional AI reasoning • SQLite persistence"
 )

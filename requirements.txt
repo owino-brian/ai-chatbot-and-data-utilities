@@ -1,6 +1,5 @@
-streamlit>=1.30.0
-pandas>=2.0.0
-streamlit
+streamlit>=1.43
 pandas
 requests
 openpyxl
+extra-streamlit-components

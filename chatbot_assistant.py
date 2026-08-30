@@ -30,6 +30,12 @@ Design principles
     chat, or switching to a different stored conversation, clears the
     active file workspace and any pending escalation state so nothing from
     one thread leaks into another.
+6.  Per-visitor privacy. The one link every visitor uses is identical for
+    everyone and carries no session data. Each browser is instead given a
+    private, unguessable id in a cookie on first visit, and every database
+    query for chat history is scoped to that id. No visitor can see,
+    list, or open another visitor's conversations, regardless of how many
+    people share the same link.
 
 Internal reference only (never rendered in the UI): the knowledge base
 currently holds KNOWLEDGE_BASE_SIZE curated topics across
@@ -61,6 +67,7 @@ from typing import Any
 import pandas as pd
 import requests
 import streamlit as st
+import extra_streamlit_components as stx
 
 
 # =============================================================================
@@ -167,6 +174,49 @@ def opening_greeting() -> str:
 
 
 # =============================================================================
+# VISITOR IDENTITY (per-browser, never part of the shared link)
+#
+# The one link every visitor uses is identical for everyone — it carries no
+# session or user information. Privacy instead comes from a random id
+# stored in a browser cookie the first time that browser opens the app.
+# The cookie is set silently (never shown, never in the URL) and is what
+# scopes "Recent chats" and message history to that one browser. A
+# different person opening the exact same link on their own device has no
+# such cookie yet, gets a brand-new random id, and sees a brand-new, empty
+# thread with nothing of anyone else's carried over.
+# =============================================================================
+
+VISITOR_COOKIE_NAME = "obo_visitor_id"
+
+
+@st.cache_resource
+def _cookie_manager() -> stx.CookieManager:
+    return stx.CookieManager(key="obo_cookie_manager")
+
+
+def get_or_create_visitor_id() -> str | None:
+    """Returns this browser's private visitor id, creating and storing one
+    in a cookie on first visit. Returns None for one render pass while the
+    cookie component is still loading in the browser — the caller should
+    stop and let Streamlit rerun rather than proceed with no identity."""
+    manager = _cookie_manager()
+    cookies = manager.get_all(key="obo_read_cookies")
+    if cookies is None:
+        return None
+    visitor_id = cookies.get(VISITOR_COOKIE_NAME)
+    if not visitor_id:
+        visitor_id = str(uuid.uuid4())
+        expires_at = datetime.now() + timedelta(days=365)
+        manager.set(
+            VISITOR_COOKIE_NAME,
+            visitor_id,
+            expires_at=expires_at,
+            key="obo_write_cookie",
+        )
+    return visitor_id
+
+
+# =============================================================================
 # DATABASE LAYER (chat history)
 # =============================================================================
 
@@ -182,12 +232,22 @@ def initialise_database() -> None:
         """
         CREATE TABLE IF NOT EXISTS conversations (
             id TEXT PRIMARY KEY,
+            visitor_id TEXT NOT NULL DEFAULT '',
             title TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
         """
     )
+    # Databases created before visitor_id existed: add the column. Rows from
+    # before this change have no visitor_id and simply become invisible in
+    # every visitor's "Recent chats" list, which is the safe default —
+    # nobody should inherit old, unscoped history.
+    conversation_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(conversations)").fetchall()
+    }
+    if "visitor_id" not in conversation_columns:
+        conn.execute("ALTER TABLE conversations ADD COLUMN visitor_id TEXT NOT NULL DEFAULT ''")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS messages (
@@ -243,7 +303,7 @@ def new_conversation_id() -> str:
     return str(uuid.uuid4())
 
 
-def ensure_conversation_row(conversation_id: str, title_seed: str) -> None:
+def ensure_conversation_row(conversation_id: str, visitor_id: str, title_seed: str) -> None:
     conn = get_connection()
     exists = conn.execute(
         "SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)
@@ -252,15 +312,27 @@ def ensure_conversation_row(conversation_id: str, title_seed: str) -> None:
         stamp = now_string()
         title = re.sub(r"\s+", " ", title_seed).strip()[:58] or "New conversation"
         conn.execute(
-            "INSERT INTO conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (conversation_id, title, stamp, stamp),
+            "INSERT INTO conversations (id, visitor_id, title, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (conversation_id, visitor_id, title, stamp, stamp),
         )
         conn.commit()
     conn.close()
 
 
-def load_conversation(conversation_id: str) -> list[dict[str, str]]:
+def load_conversation(conversation_id: str, visitor_id: str) -> list[dict[str, str]]:
+    """Loads messages for a conversation only if it belongs to this visitor.
+    A conversation_id from another visitor's browser (which is never
+    exposed anywhere a person could copy it from) simply returns nothing,
+    rather than trusting the id alone."""
     conn = get_connection()
+    owner = conn.execute(
+        "SELECT 1 FROM conversations WHERE id = ? AND visitor_id = ?",
+        (conversation_id, visitor_id),
+    ).fetchone()
+    if owner is None:
+        conn.close()
+        return []
     rows = conn.execute(
         "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id ASC",
         (conversation_id,),
@@ -281,15 +353,20 @@ def save_message(conversation_id: str, role: str, content: str) -> None:
     conn.close()
 
 
-def recent_conversations(limit: int = MAX_HISTORY_ITEMS) -> list[sqlite3.Row]:
+def recent_conversations(visitor_id: str, limit: int = MAX_HISTORY_ITEMS) -> list[sqlite3.Row]:
+    """Only ever returns conversations belonging to this visitor_id. This is
+    the fix for the cross-visitor leak: previously this had no visitor
+    filter at all, so every visitor's sidebar listed every conversation
+    ever held with the app, and clicking one loaded its messages."""
     conn = get_connection()
     rows = conn.execute(
         """
         SELECT id, title, updated_at FROM conversations c
-        WHERE EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id)
+        WHERE c.visitor_id = ?
+          AND EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id = c.id)
         ORDER BY updated_at DESC LIMIT ?
         """,
-        (limit,),
+        (visitor_id, limit),
     ).fetchall()
     conn.close()
     return rows
@@ -409,11 +486,22 @@ def reset_thread_state() -> None:
     st.session_state.pending_escalation = None
 
 
+if "visitor_id" not in st.session_state:
+    resolved_visitor_id = get_or_create_visitor_id()
+    if resolved_visitor_id is None:
+        # The cookie component needs one render pass in the browser before
+        # it can report back. Stop here rather than render with no
+        # identity yet; Streamlit reruns automatically once it responds.
+        st.stop()
+    st.session_state.visitor_id = resolved_visitor_id
+
 if "conversation_id" not in st.session_state:
     st.session_state.conversation_id = new_conversation_id()
 
 if "messages" not in st.session_state:
-    st.session_state.messages = load_conversation(st.session_state.conversation_id)
+    st.session_state.messages = load_conversation(
+        st.session_state.conversation_id, st.session_state.visitor_id
+    )
 
 if "live_search_enabled" not in st.session_state:
     st.session_state.live_search_enabled = False
@@ -1744,14 +1832,16 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**Recent chats**")
-    conversations = recent_conversations()
+    conversations = recent_conversations(st.session_state.visitor_id)
     if not conversations:
         st.caption("Your conversations will appear here once you send a message.")
     for conversation in conversations:
         label = (conversation["title"] or "New conversation")[:38]
         if st.button(label, key=f"conv_{conversation['id']}", use_container_width=True):
             st.session_state.conversation_id = conversation["id"]
-            st.session_state.messages = load_conversation(conversation["id"])
+            st.session_state.messages = load_conversation(
+                conversation["id"], st.session_state.visitor_id
+            )
             reset_thread_state()
             st.rerun()
 
@@ -1873,7 +1963,9 @@ if question or attachment_summary or attachment_error:
     st.session_state.messages.append({"role": "user", "content": display_question})
 
     if len(st.session_state.messages) == 1:
-        ensure_conversation_row(st.session_state.conversation_id, display_question)
+        ensure_conversation_row(
+            st.session_state.conversation_id, st.session_state.visitor_id, display_question
+        )
 
     save_message(st.session_state.conversation_id, "user", display_question)
 
